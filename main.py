@@ -31,15 +31,6 @@ BOT_TOKEN = "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk"  # ضع توكن ا
 ADMIN_ID = 8287678319  # ⚠️ ضع الآيدي الخاص بك هنا لتتحكم بالبوت
 PAYMENT_PROVIDER_TOKEN = ""  # توكن الدفع (اختياري للنجوم التلقائية)
 
-# أكواد الدول العربية المسموح بها
-ARAB_CODES = [
-    "20", "966", "971", "965", "974", "973", "968",
-"212", "213", "216", "218", "221", "222", "223",
-"224", "225", "226", "227", "228", "229",
-"249", "252", "253", "269", "970", "962",
-"964", "963", "961", "967"
-]
-
 # مراحل المحادثات (Conversation States)
 STATE_TRANSFER_ID, STATE_TRANSFER_AMOUNT = range(2)
 STATE_CREATE_CODE = range(2)
@@ -294,10 +285,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     user = update.effective_user
     db_user = db.get_user(user.id)
-    points = db_user[4] # index 4 is points
+    points = db_user[4] if db_user else 0
     
-    text += (
+    text = (
         f"مرحباً بك {get_user_link(user.id, user.first_name)} 👋\n\n"
+        f"🆔 الآيدي الخاص بك: <code>{user.id}</code>\n"
+        f"🏆 رصيدك الحالي: <b>{points} نقطة</b>\n"
+        f"────────────────\n"
+        f"👇 اختر من القائمة أدناه للتحكم:"
+    )
         f"🆔 الآيدي الخاص بك: <code>{user.id}</code>\n"
         f"🏆 رصيدك الحالي: <b>{points} نقطة</b>\n"
         f"────────────────\n"
