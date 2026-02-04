@@ -13,9 +13,7 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler
 )
-from PIL import Image, ImageDraw, ImageFont
 import random
-import os
 import asyncio
 import logging
 
@@ -98,9 +96,6 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # إنشاء كود التحقق
     code = random.randint(1000, 9999)
     user_codes[user_id] = code
-    
-    # إنشاء صورة الكود
-    image_path = create_code_image(code)
     
     await update.message.reply_text(
         "✅ *تم قبول الرقم بنجاح!*\n\n"
@@ -401,60 +396,6 @@ async def attack_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_text,
         parse_mode='Markdown'
     )
-
-# ───────── إنشاء صورة الكود ─────────
-def create_code_image(code):
-    # إنشاء صورة بحجم كبير
-    img = Image.new("RGB", (600, 300), color="#1a1a2e")
-    draw = ImageDraw.Draw(img)
-    
-    # إضافة خلفية مميزة
-    for i in range(20):
-        x = random.randint(0, 600)
-        y = random.randint(0, 300)
-        r = random.randint(1, 3)
-        draw.ellipse([x-r, y-r, x+r, y+r], fill="#16213e")
-    
-    # استخدام خط كبير
-    try:
-        # حاول استخدام خط عربي إذا متوفر
-        font = ImageFont.truetype("arial.ttf", 120)
-    except:
-        # استخدام الخط الافتراضي
-        font = ImageFont.load_default()
-        # إذا كان الخط الافتراضي صغير، سنضبط حجمه
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 100)
-    
-    text = str(code)
-    
-    # حساب مركز النص
-    try:
-        # طريقة حديثة للحصول على حجم النص
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-    except:
-        # طريقة قديمة
-        text_width, text_height = draw.textsize(text, font=font)
-    
-    # وضع النص في المركز
-    position = ((600 - text_width) // 2, (300 - text_height) // 2)
-    
-    # إضافة ظل للنص
-    shadow_position = (position[0] + 3, position[1] + 3)
-    draw.text(shadow_position, text, fill="#0f3460", font=font)
-    
-    # إضافة النص الرئيسي
-    draw.text(position, text, fill="#e94560", font=font)
-    
-    # إضافة إطار
-    draw.rectangle([10, 10, 590, 290], outline="#e94560", width=4)
-    
-    # حفظ الصورة
-    path = f"code_{code}_{random.randint(1000, 9999)}.png"
-    img.save(path, quality=95)
-    
-    return path
 
 # ───────── تشغيل البوت ─────────
 def main():
