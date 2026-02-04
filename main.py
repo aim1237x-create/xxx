@@ -287,18 +287,14 @@ async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
     db_user = db.get_user(user.id)
     points = db_user[4] if db_user else 0
     
-    text = (
+        text = (
         f"مرحباً بك {get_user_link(user.id, user.first_name)} 👋\n\n"
         f"🆔 الآيدي الخاص بك: <code>{user.id}</code>\n"
         f"🏆 رصيدك الحالي: <b>{points} نقطة</b>\n"
         f"────────────────\n"
         f"👇 اختر من القائمة أدناه للتحكم:"
     )
-        f"🆔 الآيدي الخاص بك: <code>{user.id}</code>\n"
-        f"🏆 رصيدك الحالي: <b>{points} نقطة</b>\n"
-        f"────────────────\n"
-        f"👇 اختر من القائمة أدناه للتحكم:"
-    )
+
     
     kb = get_main_keyboard(user.id)
     
@@ -624,10 +620,12 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
 
 async def admin_toggle_lb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     current = db.get_setting("show_leaderboard")
     new_val = "0" if current == "1" else "1"
     db.set_setting("show_leaderboard", new_val)
-    await admin_panel(update, context) # Refresh
+    await admin_panel(update, context)
 
 async def admin_start_create_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -669,6 +667,8 @@ async def admin_save_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def admin_cancel_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("تم الإلغاء")
     await admin_panel(update, context)
     return ConversationHandler.END
 
