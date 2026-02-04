@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 import random
 import os
 
-BOT_TOKEN = "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk'"
+BOT_TOKEN = "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk"
 
 ARAB_CODES = [
     "+20", "+966", "+971", "+965", "+974", "+973", "+968",
