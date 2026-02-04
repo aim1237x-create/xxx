@@ -1,21 +1,26 @@
 from telegram import (
     Update,
     KeyboardButton,
-    ReplyKeyboardMarkup
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
+    CallbackQueryHandler
 )
 from PIL import Image, ImageDraw, ImageFont
 import random
 import os
+import asyncio
+import logging
 
+# ───────── إعدادات البوت ─────────
 BOT_TOKEN = "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk"
-
 ARAB_CODES = [
     "+20", "+966", "+971", "+965", "+974", "+973", "+968",
     "+212", "+213", "+216", "+218", "+221", "+222", "+223",
@@ -24,81 +29,451 @@ ARAB_CODES = [
     "+964", "+963", "+961", "+967"
 ]
 
+# ───────── تخزين البيانات ─────────
 user_codes = {}
 user_points = {}
+user_invites = {}
+user_chats = {}
+user_data = {}
 
-# ───────── start ─────────
+# ───────── إعداد التسجيل ─────────
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# ───────── دالة البداية ─────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_chats[user_id] = update.effective_chat.id
+    
+    # معالجة رابط الدعوة
+    if context.args and context.args[0].startswith('invite_'):
+        inviter_id = int(context.args[0].split('_')[1])
+        if user_id not in user_invites:
+            user_invites[user_id] = inviter_id
+            await update.message.reply_text(
+                "🎉 مرحباً بك عبر رابط الدعوة!\n"
+                "ستحصل على 10 نقاط إضافية بعد التحقق من رقمك."
+            )
+    
     btn = KeyboardButton("📱 شارك رقمك", request_contact=True)
     kb = ReplyKeyboardMarkup([[btn]], resize_keyboard=True)
+    
     await update.message.reply_text(
-        "مرحبًا 👋\n\nيرجى مشاركة رقم هاتفك للمتابعة:",
-        reply_markup=kb
+        "مرحبًا بك في بوت الرشق! 👋\n\n"
+        "🔹 *لتتمكن من استخدام البوت، يرجى مشاركة رقم هاتفك:*\n"
+        "▫️ يجب أن يكون الرقم عربي\n"
+        "▫️ ستتلقى 20 نقطة مجانية\n"
+        "▫️ ستتلقى كود تحقق في صورة\n\n"
+        "🎯 *مميزات البوت:*\n"
+        "• رشق مباشر\n"
+        "• كسب نقاط مجاني\n"
+        "• شراء نقاط بأسعار مميزة\n"
+        "• نظام دعوة مربح\n\n"
+        "➖➖➖➖➖➖➖➖➖➖",
+        reply_markup=kb,
+        parse_mode='Markdown'
     )
 
 # ───────── استلام الرقم ─────────
 async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     phone = update.message.contact.phone_number
-
+    
+    # التحقق من الرقم العربي
     if not any(phone.startswith(code) for code in ARAB_CODES):
-        await update.message.reply_text("❌ الرقم غير تابع لدولة عربية")
+        await update.message.reply_text(
+            "❌ *الرقم غير تابع لدولة عربية*\n\n"
+            "▫️ يرجى مشاركة رقم هاتف عربي صحيح\n"
+            "▫️ يجب أن يبدأ الرقم بأحد الرموز العربية",
+            parse_mode='Markdown'
+        )
         return
-
+    
+    # إعطاء النقاط الأولية
     user_points[user_id] = 20
-
+    user_data[user_id] = {"verified": False, "phone": phone}
+    
+    # إنشاء كود التحقق
     code = random.randint(1000, 9999)
     user_codes[user_id] = code
-
+    
+    # إنشاء صورة الكود
     image_path = create_code_image(code)
-
-    await update.message.reply_text("✅ تم قبول الرقم\n🎯 حصلت على 20 نقطة")
+    
+    await update.message.reply_text(
+        "✅ *تم قبول الرقم بنجاح!*\n\n"
+        "🎁 *المكافآت التي حصلت عليها:*\n"
+        "• 20 نقطة مجانية\n"
+        "• إمكانية كسب المزيد عبر الدعوة\n\n"
+        "📸 *سيتم إرسال كود التحقق في صورة*\n"
+        "▫️ اكتب الرقم الظاهر في الصورة للتأكيد",
+        parse_mode='Markdown'
+    )
+    
+    await asyncio.sleep(1)
     await update.message.reply_photo(
         photo=open(image_path, "rb"),
-        caption="✏️ اكتب الرقم الظاهر داخل الصورة للتأكيد:"
+        caption="🔢 *أدخل الرقم الموجود في الصورة:*",
+        parse_mode='Markdown'
     )
-
+    
     os.remove(image_path)
 
 # ───────── التحقق من الكود ─────────
 async def verify_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
-
+    
     if user_id not in user_codes:
         return
-
+    
     if text == str(user_codes[user_id]):
+        user_data[user_id]["verified"] = True
+        
+        # إعطاء نقاط الدعوة إذا كان عبر رابط
+        if user_id in user_invites:
+            inviter_id = user_invites[user_id]
+            if inviter_id in user_points:
+                user_points[inviter_id] += 10
+                await context.bot.send_message(
+                    chat_id=user_chats.get(inviter_id),
+                    text="🎉 *تهانينا!*\n\n"
+                         "حصلت على 10 نقاط إضافية\n"
+                         "لأن أحد المدعوين قام بالتحقق\n\n"
+                         f"🏆 *إجمالي نقاطك الآن:* {user_points.get(inviter_id, 0)}",
+                    parse_mode='Markdown'
+                )
+            del user_invites[user_id]
+        
         await update.message.reply_text(
-            f"✅ تم التأكيد بنجاح\n🏆 نقاطك: {user_points[user_id]}"
+            "🎊 *تم التحقق بنجاح!*\n\n"
+            "✅ حسابك مفعل الآن\n"
+            "🚀 يمكنك البدء باستخدام البوت\n"
+            "👇 استخدم الأزرار للتنقل:",
+            parse_mode='Markdown'
         )
+        
+        await asyncio.sleep(1)
+        await main_menu(update, context)
         del user_codes[user_id]
+        
     else:
-        await update.message.reply_text("❌ الرقم غير صحيح، حاول مرة أخرى")
+        await update.message.reply_text(
+            "❌ *الكود غير صحيح*\n\n"
+            "▫️ تأكد من الرقم المدخل\n"
+            "▫️ يجب أن يكون مطابقاً للصورة\n"
+            "▫️ حاول مرة أخرى",
+            parse_mode='Markdown'
+        )
 
-# ───────── إنشاء صورة ─────────
+# ───────── القائمة الرئيسية ─────────
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = update.effective_user
+    
+    # إنشاء اسم المستخدم مع رابط
+    if user.username:
+        name_link = f"https://t.me/{user.username}"
+        name_display = f'<a href="{name_link}">{user.first_name}</a>'
+    else:
+        name_display = user.first_name
+    
+    points = user_points.get(user_id, 0)
+    invite_count = len([uid for uid, inviter in user_invites.items() if inviter == user_id])
+    
+    # تصميم واجهة جميلة
+    message_text = (
+        f"🌟 <b>مرحباً {name_display}!</b>\n\n"
+        f"🏆 <b>عدد نقاطك:</b> <code>{points}</code>\n"
+        f"👥 <b>عدد الأيدي:</b> <code>{invite_count}</code>\n\n"
+        "➖➖➖➖➖➖➖➖➖➖"
+    )
+    
+    # أزرار القائمة الرئيسية
+    keyboard = [
+        [KeyboardButton("🎯 أرشق الآن")],
+        [KeyboardButton("💰 كسب النقاط")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        message_text,
+        reply_markup=reply_markup,
+        parse_mode='HTML'
+    )
+
+# ───────── قائمة كسب النقاط ─────────
+async def earn_points_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [KeyboardButton("🆓 كسب النقاط مجاناً")],
+        [KeyboardButton("💳 كسب النقاط عن طريق الدفع")],
+        [KeyboardButton("🔙 العودة للرئيسية")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        "💰 *خيارات كسب النقاط*\n\n"
+        "اختر الطريقة المناسبة لك:\n\n"
+        "🆓 *مجاناً:* عبر نظام الدعوة\n"
+        "💳 *مدفوع:* شراء نقاط بأسعار مميزة\n\n"
+        "➖➖➖➖➖➖➖➖➖➖",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# ───────── كسب نقاط مجاني ─────────
+async def free_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bot_username = (await context.bot.get_me()).username
+    invite_link = f"https://t.me/{bot_username}?start=invite_{user_id}"
+    
+    message_text = (
+        "🎁 *كسب النقاط المجاني*\n\n"
+        "▫️ *مميزات نظام الدعوة:*\n"
+        "• تحصل على 10 نقاط لكل مدعو\n"
+        "• المدعو يحصل على 20 نقطة\n"
+        "• لا حدود لعدد الدعوات\n\n"
+        "🔗 *رابط الدعوة الخاص بك:*\n\n"
+        f"`{invite_link}`\n\n"
+        "▫️ *طريقة الاستخدام:*\n"
+        "1. انسخ الرابط أعلاه\n"
+        "2. أرسله لأصدقائك\n"
+        "3. عندما يسجلون ويحققون الرقم\n"
+        "4. تحصل أنت وهم على نقاط مجانية\n\n"
+        "🎯 *ملاحظة:*\n"
+        "اضغط على الرابط ليتم نسخه تلقائياً"
+    )
+    
+    await update.message.reply_text(
+        message_text,
+        parse_mode='Markdown'
+    )
+
+# ───────── كسب نقاط مدفوع ─────────
+async def paid_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("⭐ 5 نجوم - 50 نقطة", callback_data="buy_5"),
+            InlineKeyboardButton("⭐⭐ 10 نجوم - 120 نقطة", callback_data="buy_10")
+        ],
+        [
+            InlineKeyboardButton("⭐⭐⭐ 20 نجوم - 250 نقطة", callback_data="buy_20"),
+            InlineKeyboardButton("⭐⭐⭐⭐⭐ 50 نجوم - اشتراك دائم", callback_data="buy_50")
+        ],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back_earn")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message_text = (
+        "💳 *كسب النقاط عن طريق الدفع*\n\n"
+        "🎯 *الباقات المتاحة:*\n\n"
+        "⭐ *5 نجوم:*\n"
+        "• 50 نقطة\n"
+        "• سعر مناسب للمبتدئين\n\n"
+        "⭐⭐ *10 نجوم:*\n"
+        "• 120 نقطة\n"
+        "• أفضل قيمة للثمن\n\n"
+        "⭐⭐⭐ *20 نجوم:*\n"
+        "• 250 نقطة\n"
+        "• خصم 20% للكميات\n\n"
+        "⭐⭐⭐⭐⭐ *50 نجوم:*\n"
+        "• اشتراك دائم مدى الحياة\n"
+        "• إيداع مباشر في الحساب\n"
+        "• أولوية في الخدمة\n\n"
+        "💰 *طريقة الشراء:*\n"
+        "1. اختر الباقة المناسبة\n"
+        "2. سيتم إرسال تفاصيل الدفع\n"
+        "3. بعد التأكد من الدفع\n"
+        "4. تودع النقاط مباشرة في حسابك\n\n"
+        "⚠️ *ملاحظة هامة:*\n"
+        "• باقة 50 نجوم ترسل إلى الحساب الشخصي للمشرف"
+    )
+    
+    await update.message.reply_text(
+        message_text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# ───────── معالج الأزرار الداخلية ─────────
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == "back_earn":
+        await query.edit_message_text(
+            "تم العودة لقائمة كسب النقاط",
+            parse_mode='Markdown'
+        )
+        await earn_points_menu(update, context)
+    
+    elif data.startswith("buy_"):
+        packages = {
+            "buy_5": {"stars": "5 نجوم", "points": 50, "price": "سعر 5 نجوم"},
+            "buy_10": {"stars": "10 نجوم", "points": 120, "price": "سعر 10 نجوم"},
+            "buy_20": {"stars": "20 نجوم", "points": 250, "price": "سعر 20 نجوم"},
+            "buy_50": {"stars": "50 نجوم", "points": "اشتراك دائم", "price": "سعر 50 نجوم"}
+        }
+        
+        package = packages[data]
+        
+        payment_text = (
+            f"💳 *طلب شراء {package['stars']}*\n\n"
+            f"🎯 *المزايا:*\n"
+            f"• {package['points']} نقطة\n"
+            f"• {package['price']}\n\n"
+            "💰 *طريقة الدفع:*\n"
+            "1. ارسل المبلغ إلى الحساب البنكي\n"
+            "2. احفظ إيصال الدفع\n"
+            "3. تواصل مع المشرف @المشرف_معرف\n"
+            "4. أرسل له الإيصال\n"
+            "5. ستضاف النقاط خلال 5 دقائق\n\n"
+            "🏦 *تفاصيل الحساب:*\n"
+            "• اسم البنك: البنك العربي\n"
+            "• رقم الحساب: 123456789\n"
+            "• IBAN: SA1234567890123456789012\n\n"
+            "📞 *للتواصل:*\n"
+            "• @المشرف_معرف\n"
+            "• +966501234567\n\n"
+            "⚠️ *تنبيه:*\n"
+            "• احتفظ بإيصال الدفع\n"
+            "• النقاط تضاف بعد التأكد"
+        )
+        
+        await query.edit_message_text(
+            payment_text,
+            parse_mode='Markdown'
+        )
+
+# ───────── معالج النصوص ─────────
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_user.id
+    
+    # إذا كان المستخدم في مرحلة التحقق
+    if user_id in user_codes:
+        await verify_code(update, context)
+        return
+    
+    # معالجة الأوامر النصية
+    if text == "🎯 أرشق الآن":
+        await attack_menu(update, context)
+    
+    elif text == "💰 كسب النقاط":
+        await earn_points_menu(update, context)
+    
+    elif text == "🆓 كسب النقاط مجاناً":
+        await free_points(update, context)
+    
+    elif text == "💳 كسب النقاط عن طريق الدفع":
+        await paid_points(update, context)
+    
+    elif text == "🔙 العودة للرئيسية":
+        await main_menu(update, context)
+    
+    elif text == "🔙 رجوع":
+        await earn_points_menu(update, context)
+
+# ───────── قائمة الرشق ─────────
+async def attack_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    points = user_points.get(user_id, 0)
+    
+    message_text = (
+        "🎯 *قائمة الرشق*\n\n"
+        f"🏆 *رصيدك الحالي:* {points} نقطة\n\n"
+        "▫️ *تعليمات الرشق:*\n"
+        "• أدخل الرقم المراد رشقه\n"
+        "• اختر نوع الهجوم\n"
+        "• اضغط على بدء الرشق\n"
+        "• ستخصم النقاط تلقائياً\n\n"
+        "⚠️ *تحذير:*\n"
+        "الاستخدام الخاطئ قد يؤدي إلى إيقاف الحساب\n\n"
+        "👇 *أرسل الرقم الآن:*"
+    )
+    
+    await update.message.reply_text(
+        message_text,
+        parse_mode='Markdown'
+    )
+
+# ───────── إنشاء صورة الكود ─────────
 def create_code_image(code):
-    img = Image.new("RGB", (400, 200), color="white")
+    # إنشاء صورة بحجم كبير
+    img = Image.new("RGB", (600, 300), color="#1a1a2e")
     draw = ImageDraw.Draw(img)
-
+    
+    # إضافة خلفية مميزة
+    for i in range(20):
+        x = random.randint(0, 600)
+        y = random.randint(0, 300)
+        r = random.randint(1, 3)
+        draw.ellipse([x-r, y-r, x+r, y+r], fill="#16213e")
+    
+    # استخدام خط كبير
     try:
-        font = ImageFont.truetype("arial.ttf", 80)
+        # حاول استخدام خط عربي إذا متوفر
+        font = ImageFont.truetype("arial.ttf", 120)
     except:
+        # استخدام الخط الافتراضي
         font = ImageFont.load_default()
-
+        # إذا كان الخط الافتراضي صغير، سنضبط حجمه
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 100)
+    
     text = str(code)
-    w, h = draw.textsize(text, font=font)
-    draw.text(((400 - w) / 2, (200 - h) / 2), text, fill="black", font=font)
-
-    path = f"code_{code}.png"
-    img.save(path)
+    
+    # حساب مركز النص
+    try:
+        # طريقة حديثة للحصول على حجم النص
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+    except:
+        # طريقة قديمة
+        text_width, text_height = draw.textsize(text, font=font)
+    
+    # وضع النص في المركز
+    position = ((600 - text_width) // 2, (300 - text_height) // 2)
+    
+    # إضافة ظل للنص
+    shadow_position = (position[0] + 3, position[1] + 3)
+    draw.text(shadow_position, text, fill="#0f3460", font=font)
+    
+    # إضافة النص الرئيسي
+    draw.text(position, text, fill="#e94560", font=font)
+    
+    # إضافة إطار
+    draw.rectangle([10, 10, 590, 290], outline="#e94560", width=4)
+    
+    # حفظ الصورة
+    path = f"code_{code}_{random.randint(1000, 9999)}.png"
+    img.save(path, quality=95)
+    
     return path
 
 # ───────── تشغيل البوت ─────────
-app = Application.builder().token(BOT_TOKEN).build()
+def main():
+    # إنشاء تطبيق البوت
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # إضافة handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    
+    # تشغيل البوت
+    print("🤖 البوت يعمل الآن...")
+    print("📊 حالة البوت: نشط")
+    print("⚡ الإصدار: 2.0 مميز")
+    print("🔗 رابط البوت: https://t.me/your_bot_username")
+    
+    app.run_polling(drop_pending_updates=True)
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, verify_code))
-
-app.run_polling()
+if __name__ == '__main__':
+    main()
