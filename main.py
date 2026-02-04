@@ -258,23 +258,6 @@ def get_main_keyboard(user_id):
         btns.append([InlineKeyboardButton("⚙️ لوحة الإدارة", callback_data="admin_panel")])
     return InlineKeyboardMarkup(btns)
 
-async def check_verified(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data = db.get_user(user_id)
-    if not user_data:
-        # لم يسجل بعد -> طلب جهة الاتصال
-        from telegram import KeyboardButton, ReplyKeyboardMarkup
-        btn = KeyboardButton("📱 تحقق من رقمك لتبدأ", request_contact=True)
-        kb = ReplyKeyboardMarkup([[btn]], resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text(
-            "🔒 <b>التحقق الأمني</b>\n\n"
-            "للحفاظ على جودة البوت ومنع الحسابات الوهمية، يرجى مشاركة رقم هاتفك.\n"
-            "🎁 ستحصل على <b>20 نقطة</b> فور التسجيل!",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-        return False
-    return True
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🚀 المعالجات الرئيسية (Handlers)
@@ -284,68 +267,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
     
-    # حفظ الإحالة إن وجدت بشكل مؤقت حتى التسجيل
-    if args and args[0].startswith("invite_"):
-        try:
-            inviter = int(args[0].split("_")[1])
-            if inviter != user.id:
-                context.user_data['temp_referrer'] = inviter
-        except:
-            pass
-
-    if not await check_verified(update, context):
-        return
-
-    # إذا مسجل، اعرض السحابة الرئيسية
-    await send_dashboard(update, context)
-
-async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    contact = update.message.contact
-    
-    # التأكد من أن الرقم للمرسل نفسه
-    if contact.user_id != user.id:
-        await update.message.reply_text("❌ هذا الرقم لا يخص حسابك!")
-        return
-
-    phone = contact.phone_number
-    if not phone.startswith("+"): phone = "+" + phone
-    
-    valid = any(phone.startswith(code) for code in ARAB_CODES)
-    if not valid:
-        await update.message.reply_text("❌ عذراً، البوت متاح للأرقام العربية فقط.")
-        return
-
-    # التسجيل
-    referrer_id = context.user_data.get('temp_referrer')
-    success = db.add_user(user.id, user.username, user.first_name, phone, referrer_id)
-    
-    if success:
-        # مكافأة الإحالة
+    db_user = db.get_user(user.id)
+    if not db_user:
+        referrer_id = None
+        if args and args[0].startswith("invite_"):
+            try:
+                inviter = int(args[0].split("_")[1])
+                if inviter != user.id:
+                    referrer_id = inviter
+            except:
+                pass
+        
+        # تسجيل تلقائي (نضع كلمة None مكان الهاتف)
+        db.add_user(user.id, user.username, user.first_name, "None", referrer_id)
+        
         if referrer_id:
             db.update_points(referrer_id, 10, "referral", f"دعوة: {user.first_name}")
-            # التنبيه الذكي
             try:
-                msg = (
-                    f"🔔 <b>تنبيه إحالة جديدة!</b>\n"
-                    f"قام {get_user_link(user.id, user.first_name)} بالدخول عبر رابطك.\n"
-                    f"💰 تمت إضافة <b>10 نقاط</b> لرصيدك."
-                )
+                msg = f"🔔 <b>إحالة جديدة!</b>\nحصلت على 10 نقاط لدعوة {user.first_name}"
                 await context.bot.send_message(referrer_id, msg, parse_mode="HTML")
-            except:
-                pass # قد يكون البوت محظوراً من قبل المستخدم
+            except: pass
 
-        await update.message.reply_text("✅ تم التحقق بنجاح! جاري تحميل القائمة...", reply_markup=None)
-        await send_dashboard(update, context)
-    else:
-        await send_dashboard(update, context)
+    await send_dashboard(update, context)
+
 
 async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     user = update.effective_user
     db_user = db.get_user(user.id)
     points = db_user[4] # index 4 is points
     
-    text = (
+    text += (
         f"مرحباً بك {get_user_link(user.id, user.first_name)} 👋\n\n"
         f"🆔 الآيدي الخاص بك: <code>{user.id}</code>\n"
         f"🏆 رصيدك الحالي: <b>{points} نقطة</b>\n"
@@ -762,8 +713,7 @@ def main():
 
     # Handlers Registration
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
-    
+        
     # Register Conversations
     application.add_handler(transfer_conv)
     application.add_handler(redeem_conv)
@@ -782,4 +732,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
