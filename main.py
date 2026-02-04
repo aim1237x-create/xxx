@@ -27,6 +27,14 @@ ARAB_CODES = [
 "964", "963", "961", "967"
 ]
 
+# ───────── متغيرات إضافية ─────────
+SUPPORT_USERNAME = "your_support_username"  # ضع اسم المستخدم للدعم هنا
+ADMIN_USERNAME = "your_admin_username"     # ضع اسم المشرف هنا
+BANK_NAME = "البنك العربي"
+BANK_ACCOUNT = "123456789"
+BANK_IBAN = "SA1234567890123456789012"
+PHONE_NUMBER = "+966501234567"
+
 # ───────── تخزين البيانات ─────────
 user_codes = {}
 user_points = {}
@@ -52,7 +60,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_invites[user_id] = inviter_id
             await update.message.reply_text(
                 "🎉 مرحباً بك عبر رابط الدعوة!\n"
-                "ستحصل على 10 نقاط إضافية بعد التحقق من رقمك."
+                "ستحصل على 10 نقاط إضافية بعد التسجيل."
             )
     
     btn = KeyboardButton("📱 شارك رقمك", request_contact=True)
@@ -62,8 +70,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "مرحبًا بك في بوت الرشق! 👋\n\n"
         "🔹 *لتتمكن من استخدام البوت، يرجى مشاركة رقم هاتفك:*\n"
         "▫️ يجب أن يكون الرقم عربي\n"
-        "▫️ ستتلقى 20 نقطة مجانية\n"
-        "▫️ ستتلقى كود تحقق في صورة\n\n"
+        "▫️ ستتلقى 20 نقطة مجانية فوراً\n\n"
         "🎯 *مميزات البوت:*\n"
         "• رشق مباشر\n"
         "• كسب نقاط مجاني\n"
@@ -91,77 +98,36 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # إعطاء النقاط الأولية
     user_points[user_id] = 20
-    user_data[user_id] = {"verified": False, "phone": phone}
+    user_data[user_id] = {"verified": True, "phone": phone}
     
-    # إنشاء كود التحقق
-    code = random.randint(1000, 9999)
-    user_codes[user_id] = code
+    # إعطاء نقاط الدعوة إذا كان عبر رابط
+    if user_id in user_invites:
+        inviter_id = user_invites[user_id]
+        if inviter_id in user_points:
+            user_points[inviter_id] += 10
+            await context.bot.send_message(
+                chat_id=user_chats.get(inviter_id),
+                text="🎉 *تهانينا!*\n\n"
+                     "حصلت على 10 نقاط إضافية\n"
+                     "لأن أحد المدعوين قام بالتسجيل\n\n"
+                     f"🏆 *إجمالي نقاطك الآن:* {user_points.get(inviter_id, 0)}",
+                parse_mode='Markdown'
+            )
+        del user_invites[user_id]
     
     await update.message.reply_text(
-        "✅ *تم قبول الرقم بنجاح!*\n\n"
+        "✅ *تم التسجيل بنجاح!*\n\n"
         "🎁 *المكافآت التي حصلت عليها:*\n"
-        "• 20 نقطة مجانية\n"
-        "• إمكانية كسب المزيد عبر الدعوة\n\n"
-        "📸 *سيتم إرسال كود التحقق في صورة*\n"
-        "▫️ اكتب الرقم الظاهر في الصورة للتأكيد",
+        f"• 20 نقطة مجانية\n"
+        "• حسابك مفعل الآن\n"
+        "🚀 يمكنك البدء باستخدام البوت\n\n"
+        f"🏆 *إجمالي نقاطك الآن:* {user_points.get(user_id, 0)}\n\n"
+        "👇 استخدم الأزرار للتنقل:",
         parse_mode='Markdown'
     )
     
     await asyncio.sleep(1)
-    await update.message.reply_photo(
-        photo=open(image_path, "rb"),
-        caption="🔢 *أدخل الرقم الموجود في الصورة:*",
-        parse_mode='Markdown'
-    )
-    
-    os.remove(image_path)
-
-# ───────── التحقق من الكود ─────────
-async def verify_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text
-    
-    if user_id not in user_codes:
-        return
-    
-    if text == str(user_codes[user_id]):
-        user_data[user_id]["verified"] = True
-        
-        # إعطاء نقاط الدعوة إذا كان عبر رابط
-        if user_id in user_invites:
-            inviter_id = user_invites[user_id]
-            if inviter_id in user_points:
-                user_points[inviter_id] += 10
-                await context.bot.send_message(
-                    chat_id=user_chats.get(inviter_id),
-                    text="🎉 *تهانينا!*\n\n"
-                         "حصلت على 10 نقاط إضافية\n"
-                         "لأن أحد المدعوين قام بالتحقق\n\n"
-                         f"🏆 *إجمالي نقاطك الآن:* {user_points.get(inviter_id, 0)}",
-                    parse_mode='Markdown'
-                )
-            del user_invites[user_id]
-        
-        await update.message.reply_text(
-            "🎊 *تم التحقق بنجاح!*\n\n"
-            "✅ حسابك مفعل الآن\n"
-            "🚀 يمكنك البدء باستخدام البوت\n"
-            "👇 استخدم الأزرار للتنقل:",
-            parse_mode='Markdown'
-        )
-        
-        await asyncio.sleep(1)
-        await main_menu(update, context)
-        del user_codes[user_id]
-        
-    else:
-        await update.message.reply_text(
-            "❌ *الكود غير صحيح*\n\n"
-            "▫️ تأكد من الرقم المدخل\n"
-            "▫️ يجب أن يكون مطابقاً للصورة\n"
-            "▫️ حاول مرة أخرى",
-            parse_mode='Markdown'
-        )
+    await main_menu(update, context)
 
 # ───────── القائمة الرئيسية ─────────
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -189,7 +155,8 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # أزرار القائمة الرئيسية
     keyboard = [
         [KeyboardButton("🎯 أرشق الآن")],
-        [KeyboardButton("💰 كسب النقاط")]
+        [KeyboardButton("💰 كسب النقاط")],
+        [KeyboardButton("📞 خدمة العملاء")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -235,7 +202,7 @@ async def free_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "▫️ *طريقة الاستخدام:*\n"
         "1. انسخ الرابط أعلاه\n"
         "2. أرسله لأصدقائك\n"
-        "3. عندما يسجلون ويحققون الرقم\n"
+        "3. عندما يسجلون\n"
         "4. تحصل أنت وهم على نقاط مجانية\n\n"
         "🎯 *ملاحظة:*\n"
         "اضغط على الرابط ليتم نسخه تلقائياً"
@@ -282,13 +249,43 @@ async def paid_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. سيتم إرسال تفاصيل الدفع\n"
         "3. بعد التأكد من الدفع\n"
         "4. تودع النقاط مباشرة في حسابك\n\n"
-        "⚠️ *ملاحظة هامة:*\n"
-        "• باقة 50 نجوم ترسل إلى الحساب الشخصي للمشرف"
+        f"⚠️ *ملاحظة هامة:*\n"
+        f"• باقة 50 نجوم ترسل إلى الحساب الشخصي للمشرف @{ADMIN_USERNAME}"
     )
     
     await update.message.reply_text(
         message_text,
         reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+# ───────── خدمة العملاء ─────────
+async def support_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_profile_link = f"https://t.me/{user.username}" if user.username else "غير متوفر"
+    
+    message_text = (
+        "📞 *خدمة العملاء والدعم الفني*\n\n"
+        f"👤 *اسمك:* {user.first_name}\n"
+        f"🔗 *رابط حسابك:* {user_profile_link}\n\n"
+        "🎯 *طرق التواصل مع الدعم:*\n\n"
+        f"🔹 *المشرف:* @{ADMIN_USERNAME}\n"
+        f"🔹 *دعم فني:* @{SUPPORT_USERNAME}\n"
+        f"📞 *هاتف:* {PHONE_NUMBER}\n\n"
+        "💰 *تفاصيل الحساب البنكي للدفع:*\n"
+        f"🏦 *اسم البنك:* {BANK_NAME}\n"
+        f"🔢 *رقم الحساب:* {BANK_ACCOUNT}\n"
+        f"💳 *IBAN:* `{BANK_IBAN}`\n\n"
+        "🕒 *أوقات العمل:*\n"
+        "• 24 ساعة / 7 أيام\n\n"
+        "📝 *ملاحظات:*\n"
+        "• عند التواصل أرسل اسم المستخدم الخاص بك\n"
+        "• تأكد من حفظ إيصال الدفع\n"
+        "• يتم الرد خلال 5 دقائق كحد أقصى"
+    )
+    
+    await update.message.reply_text(
+        message_text,
         parse_mode='Markdown'
     )
 
@@ -323,18 +320,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• {package['points']} نقطة\n"
             f"• {package['price']}\n\n"
             "💰 *طريقة الدفع:*\n"
-            "1. ارسل المبلغ إلى الحساب البنكي\n"
-            "2. احفظ إيصال الدفع\n"
-            "3. تواصل مع المشرف @المشرف_معرف\n"
+            f"1. ارسل المبلغ إلى الحساب البنكي\n"
+            f"2. احفظ إيصال الدفع\n"
+            f"3. تواصل مع المشرف @{ADMIN_USERNAME}\n"
             "4. أرسل له الإيصال\n"
             "5. ستضاف النقاط خلال 5 دقائق\n\n"
-            "🏦 *تفاصيل الحساب:*\n"
-            "• اسم البنك: البنك العربي\n"
-            "• رقم الحساب: 123456789\n"
-            "• IBAN: SA1234567890123456789012\n\n"
-            "📞 *للتواصل:*\n"
-            "• @المشرف_معرف\n"
-            "• +966501234567\n\n"
+            f"🏦 *تفاصيل الحساب:*\n"
+            f"• اسم البنك: {BANK_NAME}\n"
+            f"• رقم الحساب: {BANK_ACCOUNT}\n"
+            f"• IBAN: {BANK_IBAN}\n\n"
+            f"📞 *للتواصل:*\n"
+            f"• @{ADMIN_USERNAME}\n"
+            f"• {PHONE_NUMBER}\n\n"
             "⚠️ *تنبيه:*\n"
             "• احتفظ بإيصال الدفع\n"
             "• النقاط تضاف بعد التأكد"
@@ -350,17 +347,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
     
-    # إذا كان المستخدم في مرحلة التحقق
-    if user_id in user_codes:
-        await verify_code(update, context)
-        return
-    
     # معالجة الأوامر النصية
     if text == "🎯 أرشق الآن":
         await attack_menu(update, context)
     
     elif text == "💰 كسب النقاط":
         await earn_points_menu(update, context)
+    
+    elif text == "📞 خدمة العملاء":
+        await support_service(update, context)
     
     elif text == "🆓 كسب النقاط مجاناً":
         await free_points(update, context)
@@ -411,8 +406,10 @@ def main():
     # تشغيل البوت
     print("🤖 البوت يعمل الآن...")
     print("📊 حالة البوت: نشط")
-    print("⚡ الإصدار: 2.0 مميز")
+    print("⚡ الإصدار: 3.0 (بدون صور)")
     print("🔗 رابط البوت: https://t.me/your_bot_username")
+    print(f"👤 الدعم: @{SUPPORT_USERNAME}")
+    print(f"👑 المشرف: @{ADMIN_USERNAME}")
     
     app.run_polling(drop_pending_updates=True)
 
