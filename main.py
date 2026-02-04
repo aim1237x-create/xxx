@@ -287,7 +287,7 @@ async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
     db_user = db.get_user(user.id)
     points = db_user[4] if db_user else 0
     
-        text = (
+    text = (
         f"مرحباً بك {get_user_link(user.id, user.first_name)} 👋\n\n"
         f"🆔 الآيدي الخاص بك: <code>{user.id}</code>\n"
         f"🏆 رصيدك الحالي: <b>{points} نقطة</b>\n"
