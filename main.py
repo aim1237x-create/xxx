@@ -39,14 +39,10 @@ from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError
 # ⚙️ إعدادات البوت والتهيئة المحسنة - القراءة من متغيرات البيئة
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# قراءة التوكنات من متغيرات البيئة مع قيم افتراضية للتجربة
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk")
-ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8287678319"))
-PAYMENT_PROVIDER_TOKEN = os.getenv("TELEGRAM_PAYMENT_TOKEN", "")
-
-# ⚠️ تحذير: يجب تعيين التوكنات الفعلية في متغيرات البيئة في الإنتاج
-if BOT_TOKEN == "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk":
-    print("⚠️ تحذير: يتم استخدام التوكن الافتراضي. غير آمن للإنتاج!")
+# توكن البوت موضوع مباشرة (بدون ENV)
+BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+ADMIN_ID = 8287678319
+PAYMENT_PROVIDER_TOKEN = ""
 
 # مراحل المحادثات (Conversation States)
 STATE_TRANSFER_ID, STATE_TRANSFER_AMOUNT = range(2)
