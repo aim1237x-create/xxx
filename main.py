@@ -4807,7 +4807,7 @@ async def unknown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.answer("❌ هذا الزر لم يتم برمجته بعد!", show_alert=True)
 
-def main():
+async def main():
     """الدالة الرئيسية لتشغيل البوت مع تحسينات متقدمة"""
     
     # التحقق من التوكنات
@@ -5018,8 +5018,9 @@ def main():
     )
 
 if __name__ == "__main__":
+    import asyncio
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n\n🛑 تم إيقاف البوت بواسطة المستخدم")
     except Exception as e:
