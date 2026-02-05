@@ -1,3 +1,5 @@
+[file name]: main.py
+[file content begin]
 import logging
 import sqlite3
 import html
@@ -101,7 +103,6 @@ class AsyncDatabaseManager:
         self.cache = {}
         self.cache_timestamps = {}
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="DBThread")
-        self.init_database_sync()
         self.user_last_activity = {}
         self.rate_limit_data = defaultdict(list)
         
@@ -1715,10 +1716,6 @@ async def safe_api_call(func, *args, **kwargs):
         logger.error(f"خطأ غير متوقع في API: {e}")
         return None
 
-async def check_channel_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple:
-    """التحقق من اشتراك المستخدم في القنوات المطلوبة"""
-    return await db.check_channel_subscription(user_id, context)
-
 def is_admin(user_id: int) -> bool:
     """التحقق إذا كان المستخدم أدمن"""
     return user_id == ADMIN_ID
@@ -1876,7 +1873,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # التحقق من اشتراك القنوات
-    subscribed, message = await check_channel_subscription(user.id, context)
+    subscribed, message = await db.check_channel_subscription(user.id, context)
     if not subscribed:
         await update.message.reply_text(message, parse_mode="HTML")
         return
@@ -1954,7 +1951,7 @@ async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
         return
     
     # التحقق من اشتراك القنوات
-    subscribed, message = await check_channel_subscription(user.id, context)
+    subscribed, message = await db.check_channel_subscription(user.id, context)
     if not subscribed:
         if update.callback_query:
             await update.callback_query.edit_message_text(message, parse_mode="HTML")
@@ -4427,7 +4424,7 @@ async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     # التحقق من اشتراك القنوات
-    subscribed, message = await check_channel_subscription(query.from_user.id, context)
+    subscribed, message = await db.check_channel_subscription(query.from_user.id, context)
     if not subscribed:
         await query.edit_message_text(message, parse_mode="HTML")
         return
@@ -4631,7 +4628,7 @@ async def start_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     # التحقق من اشتراك القنوات
-    subscribed, message = await check_channel_subscription(query.from_user.id, context)
+    subscribed, message = await db.check_channel_subscription(query.from_user.id, context)
     if not subscribed:
         await query.edit_message_text(message, parse_mode="HTML")
         return
@@ -4758,19 +4755,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"خطأ في معالج الأخطاء نفسه: {e}")
 
-async def post_init(application: Application):
-    """تهيئة ما بعد التشغيل"""
-    # بدء مدقق Timeout للمحادثات
-    await conv_manager.start_timeout_checker(application)
-    
-    # تنظيف البيانات القديمة تلقائياً
-    asyncio.create_task(periodic_cleanup())
-    
-    # إعادة تعيين Rate Limiting يومياً
-    asyncio.create_task(daily_rate_limit_reset())
-    
-    logger.info("✅ تم تهيئة البوت بنجاح مع جميع الميزات")
-
 async def periodic_cleanup():
     """تنظيف دوري للبيانات"""
     while True:
@@ -4813,7 +4797,7 @@ async def main():
         return
     
     # إنشاء التطبيق
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # إضافة معالجة الأخطاء
     application.add_error_handler(error_handler)
@@ -4965,7 +4949,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(admin_broadcast_menu, pattern="^admin_broadcast$"))
     application.add_handler(CallbackQueryHandler(admin_analytics_menu, pattern="^admin_analytics$"))
     application.add_handler(CallbackQueryHandler(admin_codes_menu, pattern="^admin_codes$"))
-    application.add_handler(CallbackQueryHandler(admin_toggle_maintenance, pattern="^admin_toggle_maintenance$"))
+    application.add_handler(CallbackQueryHandler(admin_toggle_maintenance, pattern="^admin_maintenance$"))
     application.add_handler(CallbackQueryHandler(admin_cleanup_data, pattern="^admin_cleanup$"))
     application.add_handler(CallbackQueryHandler(admin_cleanup_confirm, pattern="^admin_cleanup_confirm$"))
     
@@ -4983,29 +4967,17 @@ async def main():
     print("🤖 بوت النقاط المتطور - الإصدار المحسن للإنتاج")
     print("="*60)
     print(f"🆔 الأدمن: {ADMIN_ID}")
-    print(f"🔧 WAL Mode: 🟢 مفعل")
-    print(f"🛡️ Rate Limiting: 🟢 مفعل")
-    print(f"💾 Connection Pool: 🟢 مفعل")
-    print(f"⏱️ Conversation Timeout: {await db.get_setting('conversation_timeout', 300)} ثانية")
-    print(f"🔄 Flood Control: 🟢 مفعل")
-    print("="*60)
-    
-    # الحصول على إحصائيات أولية
-    try:
-        users_count = (await db.get_global_stats())[0]
-        maintenance = await db.get_setting("maintenance_mode")
-        print(f"📊 عدد المستخدمين: {users_count:,}")
-        print(f"🔧 وضع الصيانة: {'🟢 مفعل' if maintenance else '🔴 معطل'}")
-        print(f"⭐ نظام الدفع: {'🟢 مفعل' if PAYMENT_PROVIDER_TOKEN else '🔴 معطل'}")
-    except:
-        print("📊 جاري تحميل الإحصائيات...")
-    
     print("="*60)
     print("✅ البوت يعمل بكفاءة عالية مع جميع التحسينات...")
     print("="*60 + "\n")
     
+    # بدء المهام المتكررة
+    asyncio.create_task(periodic_cleanup())
+    asyncio.create_task(daily_rate_limit_reset())
+    asyncio.create_task(conv_manager.start_timeout_checker(application))
+    
     # تشغيل البوت
-    application.run_polling(
+    await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         poll_interval=0.5,
         timeout=30,
@@ -5014,11 +4986,12 @@ async def main():
     )
 
 if __name__ == "__main__":
-    import asyncio
     try:
+        import asyncio
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n\n🛑 تم إيقاف البوت بواسطة المستخدم")
     except Exception as e:
         logger.error(f"خطأ فادح في تشغيل البوت: {e}")
         print(f"❌ خطأ فادح: {e}")
+[file content end]
