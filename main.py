@@ -4,13 +4,17 @@ import html
 import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
+import json
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
-    User
+    User,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument
 )
 from telegram.ext import (
     Application,
@@ -29,12 +33,15 @@ from telegram.ext import (
 
 BOT_TOKEN = "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk"  # ضع توكن البوت
 ADMIN_ID = 8287678319  # ⚠️ ضع الآيدي الخاص بك هنا لتتحكم بالبوت
-PAYMENT_PROVIDER_TOKEN = ""  # توكن الدفع (اختياري للنجوم التلقائية)
 
 # مراحل المحادثات (Conversation States)
 STATE_TRANSFER_ID, STATE_TRANSFER_AMOUNT = range(2)
 STATE_CREATE_CODE = range(2)
 STATE_REDEEM_CODE = range(2)
+STATE_CHANNEL_ID, STATE_CHANNEL_LINK = range(2, 4)
+STATE_BROADCAST_MESSAGE, STATE_BROADCAST_MEDIA = range(4, 6)
+STATE_USER_SEARCH, STATE_USER_MANAGE = range(6, 8)
+STATE_SETTINGS_MENU = range(8, 9)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -64,7 +71,8 @@ class DatabaseManager:
                 points INTEGER DEFAULT 0,
                 referrer_id INTEGER,
                 last_daily_bonus TEXT,
-                joined_date TEXT
+                joined_date TEXT,
+                is_banned INTEGER DEFAULT 0
             )
         ''')
         # جدول العمليات (السجل)
@@ -103,13 +111,49 @@ class DatabaseManager:
                 value TEXT
             )
         ''')
+        # جدول القنوات الإجبارية
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS forced_channels (
+                channel_id TEXT PRIMARY KEY,
+                channel_link TEXT,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+        # جدول عمليات الدفع بالنجوم
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS star_payments (
+                payment_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                stars INTEGER,
+                points INTEGER,
+                timestamp TEXT,
+                status TEXT DEFAULT 'completed'
+            )
+        ''')
+        # جدول الإذاعات
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message TEXT,
+                media_type TEXT,
+                sent_to INTEGER,
+                failed_to INTEGER,
+                pinned INTEGER DEFAULT 0,
+                timestamp TEXT
+            )
+        ''')
         self.conn.commit()
 
     def init_settings(self):
         # القيم الافتراضية
         default_settings = {
             "tax_percent": "25",
-            "show_leaderboard": "1"  # 1 = True, 0 = False
+            "show_leaderboard": "1",  # 1 = True, 0 = False
+            "maintenance_mode": "0",  # 0 = False, 1 = True
+            "daily_bonus_amount": "5",
+            "referral_points": "10",
+            "min_transfer": "10",
+            "welcome_points": "20"
         }
         for key, val in default_settings.items():
             try:
@@ -122,9 +166,10 @@ class DatabaseManager:
     def add_user(self, user_id, username, full_name, phone, referrer_id=None):
         try:
             date = datetime.now().isoformat()
+            welcome_points = int(self.get_setting("welcome_points") or 20)
             self.cursor.execute(
-                "INSERT INTO users (user_id, username, full_name, phone, points, referrer_id, joined_date) VALUES (?, ?, ?, ?, 20, ?, ?)",
-                (user_id, username, full_name, phone, referrer_id, date)
+                "INSERT INTO users (user_id, username, full_name, phone, points, referrer_id, joined_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, username, full_name, phone, welcome_points, referrer_id, date)
             )
             self.conn.commit()
             return True
@@ -133,6 +178,10 @@ class DatabaseManager:
 
     def get_user(self, user_id):
         self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        return self.cursor.fetchone()
+
+    def get_user_by_username(self, username):
+        self.cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
         return self.cursor.fetchone()
 
     def update_points(self, user_id, amount, reason, details=""):
@@ -147,12 +196,26 @@ class DatabaseManager:
         elif reason == "code": tx_type = "🎫 كود"
         elif reason == "attack": tx_type = "🎯 رشق"
         elif reason == "referral": tx_type = "👥 إحالة"
+        elif reason == "admin_add": tx_type = "👑 إضافة من الأدمن"
+        elif reason == "admin_deduct": tx_type = "👑 خصم من الأدمن"
 
         self.cursor.execute(
             "INSERT INTO transactions (user_id, amount, type, details, timestamp) VALUES (?, ?, ?, ?, ?)",
             (user_id, amount, tx_type, details, datetime.now().strftime("%Y-%m-%d %H:%M"))
         )
         self.conn.commit()
+
+    def ban_user(self, user_id):
+        self.cursor.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+
+    def unban_user(self, user_id):
+        self.cursor.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+
+    def is_banned(self, user_id):
+        user = self.get_user(user_id)
+        return user and user[8] == 1
 
     def get_history(self, user_id, limit=5):
         self.cursor.execute(
@@ -162,7 +225,6 @@ class DatabaseManager:
         return self.cursor.fetchall()
 
     def get_top_referrers(self, limit=3):
-        # جلب أكثر الأشخاص دعوةً بناءً على عدد مرات تكرارهم في عمود referrer_id
         self.cursor.execute('''
             SELECT referrer_id, COUNT(*) as count 
             FROM users 
@@ -177,8 +239,42 @@ class DatabaseManager:
         for uid, count in top_ids:
             user = self.get_user(uid)
             if user:
-                results.append((user, count)) # user tuple contains all info
+                results.append((user, count))
         return results
+
+    # --- قنوات الإشتراك الإجباري ---
+    def add_channel(self, channel_id, channel_link):
+        try:
+            self.cursor.execute(
+                "INSERT INTO forced_channels (channel_id, channel_link) VALUES (?, ?)",
+                (channel_id, channel_link)
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def update_channel(self, channel_id, channel_link):
+        self.cursor.execute(
+            "UPDATE forced_channels SET channel_link = ? WHERE channel_id = ?",
+            (channel_link, channel_id)
+        )
+        self.conn.commit()
+
+    def toggle_channel(self, channel_id, active):
+        self.cursor.execute(
+            "UPDATE forced_channels SET is_active = ? WHERE channel_id = ?",
+            (1 if active else 0, channel_id)
+        )
+        self.conn.commit()
+
+    def get_channels(self):
+        self.cursor.execute("SELECT channel_id, channel_link, is_active FROM forced_channels")
+        return self.cursor.fetchall()
+
+    def delete_channel(self, channel_id):
+        self.cursor.execute("DELETE FROM forced_channels WHERE channel_id = ?", (channel_id,))
+        self.conn.commit()
 
     # --- عمليات الأدمن والإعدادات ---
     def get_setting(self, key):
@@ -190,11 +286,61 @@ class DatabaseManager:
         self.cursor.execute("UPDATE settings SET value = ? WHERE key = ?", (str(value), key))
         self.conn.commit()
 
+    def get_all_users(self):
+        self.cursor.execute("SELECT user_id, username, full_name, points FROM users WHERE is_banned = 0")
+        return self.cursor.fetchall()
+
+    def get_new_users_stats(self, days=1):
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        self.cursor.execute(
+            "SELECT COUNT(*) FROM users WHERE joined_date > ? AND is_banned = 0",
+            (cutoff,)
+        )
+        return self.cursor.fetchone()[0]
+
     def get_global_stats(self):
-        users_count = self.cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        total_points = self.cursor.execute("SELECT SUM(points) FROM users").fetchone()[0] or 0
+        users_count = self.cursor.execute("SELECT COUNT(*) FROM users WHERE is_banned = 0").fetchone()[0]
+        total_points = self.cursor.execute("SELECT SUM(points) FROM users WHERE is_banned = 0").fetchone()[0] or 0
         total_tx = self.cursor.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-        return users_count, total_points, total_tx
+        
+        # النجوم المشتراة
+        self.cursor.execute("SELECT SUM(stars) FROM star_payments WHERE status = 'completed'")
+        total_stars = self.cursor.fetchone()[0] or 0
+        
+        # العمليات في آخر 24 ساعة
+        cutoff = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+        self.cursor.execute("SELECT COUNT(*) FROM transactions WHERE timestamp > ?", (cutoff,))
+        last_24h_tx = self.cursor.fetchone()[0]
+        
+        return users_count, total_points, total_tx, total_stars, last_24h_tx
+
+    def get_top_rich_users(self, limit=10):
+        self.cursor.execute(
+            "SELECT user_id, username, full_name, points FROM users WHERE is_banned = 0 ORDER BY points DESC LIMIT ?",
+            (limit,)
+        )
+        return self.cursor.fetchall()
+
+    # --- نظام الدفع بالنجوم ---
+    def add_star_payment(self, payment_id, user_id, stars, points):
+        self.cursor.execute(
+            "INSERT INTO star_payments (payment_id, user_id, stars, points, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (payment_id, user_id, stars, points, datetime.now().isoformat())
+        )
+        self.conn.commit()
+
+    def get_star_payment(self, payment_id):
+        self.cursor.execute("SELECT * FROM star_payments WHERE payment_id = ?", (payment_id,))
+        return self.cursor.fetchone()
+
+    # --- نظام الإذاعة ---
+    def add_broadcast(self, message, media_type, sent_to, failed_to, pinned=0):
+        self.cursor.execute(
+            "INSERT INTO broadcasts (message, media_type, sent_to, failed_to, pinned, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (message, media_type, sent_to, failed_to, pinned, datetime.now().isoformat())
+        )
+        self.conn.commit()
+        return self.cursor.lastrowid
 
     def create_promo_code(self, code, points, max_uses):
         try:
@@ -208,7 +354,6 @@ class DatabaseManager:
             return False
 
     def redeem_promo_code(self, user_id, code):
-        # التحقق من وجود الكود وصلاحيته
         self.cursor.execute("SELECT points, max_uses, current_uses, active FROM promo_codes WHERE code = ?", (code,))
         res = self.cursor.fetchone()
         if not res: return "not_found"
@@ -217,11 +362,9 @@ class DatabaseManager:
         
         if not active or current_uses >= max_uses: return "expired"
         
-        # التحقق من الاستخدام السابق
         self.cursor.execute("SELECT * FROM code_usage WHERE user_id = ? AND code = ?", (user_id, code))
         if self.cursor.fetchone(): return "used"
         
-        # تنفيذ العملية
         self.cursor.execute("UPDATE promo_codes SET current_uses = current_uses + 1 WHERE code = ?", (code,))
         self.cursor.execute("INSERT INTO code_usage (user_id, code) VALUES (?, ?)", (user_id, code))
         self.update_points(user_id, points, "code", f"Code: {code}")
@@ -249,6 +392,10 @@ def get_main_keyboard(user_id):
         btns.append([InlineKeyboardButton("⚙️ لوحة الإدارة", callback_data="admin_panel")])
     return InlineKeyboardMarkup(btns)
 
+def check_maintenance_mode(user_id):
+    if user_id == ADMIN_ID:
+        return False
+    return db.get_setting("maintenance_mode") == "1"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🚀 المعالجات الرئيسية (Handlers)
@@ -256,6 +403,16 @@ def get_main_keyboard(user_id):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    # التحقق من وضع الصيانة
+    if check_maintenance_mode(user.id):
+        await update.message.reply_text(
+            "🔧 البوت قيد الصيانة حاليًا.\n"
+            "سيتم فتحه قريبًا بإذن الله.\n"
+            "شكرًا لتفهمكم."
+        )
+        return
+    
     args = context.args
     
     db_user = db.get_user(user.id)
@@ -269,21 +426,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
         
-        # تسجيل تلقائي (نضع كلمة None مكان الهاتف)
         db.add_user(user.id, user.username, user.first_name, "None", referrer_id)
         
         if referrer_id:
-            db.update_points(referrer_id, 10, "referral", f"دعوة: {user.first_name}")
+            referral_points = int(db.get_setting("referral_points") or 10)
+            db.update_points(referrer_id, referral_points, "referral", f"دعوة: {user.first_name}")
             try:
-                msg = f"🔔 <b>إحالة جديدة!</b>\nحصلت على 10 نقاط لدعوة {user.first_name}"
+                msg = f"🔔 <b>إحالة جديدة!</b>\nحصلت على {referral_points} نقاط لدعوة {user.first_name}"
                 await context.bot.send_message(referrer_id, msg, parse_mode="HTML")
             except: pass
 
     await send_dashboard(update, context)
 
-
 async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     user = update.effective_user
+    
+    # التحقق من وضع الصيانة
+    if check_maintenance_mode(user.id):
+        if update.callback_query:
+            await update.callback_query.answer("البوت قيد الصيانة حالياً", show_alert=True)
+        return
+    
     db_user = db.get_user(user.id)
     points = db_user[4] if db_user else 0
     
@@ -294,7 +457,6 @@ async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
         f"────────────────\n"
         f"👇 اختر من القائمة أدناه للتحكم:"
     )
-
     
     kb = get_main_keyboard(user.id)
     
@@ -304,373 +466,726 @@ async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
         await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🔄 التنقل والقوائم الفرعية (Sub-Menus)
+# 💫 نظام الدفع التلقائي بالنجوم (Telegram Stars)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def main_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy_stars_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     user_id = query.from_user.id
     await query.answer()
-
-    # --- الرجوع للرئيسية ---
-    if data == "main_menu":
-        await send_dashboard(update, context, edit=True)
-
-    # --- قائمة الرشق (Placeholder) ---
-    elif data == "attack_menu":
-        user_points = db.get_user(user_id)[4]
-        text = (
-            f"🎯 <b>قسم الرشق وزيادة التفاعل</b>\n"
-            f"💰 رصيدك: <b>{user_points}</b>\n\n"
-            "هذا القسم تحت الصيانة حالياً لضمان أعلى جودة.\n"
-            "سيتم تفعيله قريباً!"
-        )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]])
-        await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
-
-    # --- قائمة تجميع النقاط ---
-    elif data == "collect_points":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 رابط الإحالة", callback_data="referral_page")],
-            [InlineKeyboardButton("📅 المكافأة اليومية", callback_data="daily_bonus")],
-            [InlineKeyboardButton("🎫 استبدال كود", callback_data="redeem_code_start")],
-            [InlineKeyboardButton("💳 شراء نقاط", callback_data="buy_points_menu")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
-        ])
-        await query.edit_message_text(
-            "🔄 <b>قسم تجميع النقاط</b>\nاختر الطريقة الأنسب لك لزيادة رصيدك:",
-            reply_markup=kb, parse_mode="HTML"
-        )
-
-    # --- صفحة الإحالة ---
-    elif data == "referral_page":
-        link = f"https://t.me/{context.bot.username}?start=invite_{user_id}"
-        
-        # لوحة الشرف
-        leaderboard_text = ""
-        if db.get_setting("show_leaderboard") == "1":
-            top_users = db.get_top_referrers()
-            if top_users:
-                leaderboard_text = "\n\n🏆 <b>أكثر الأعضاء تميزاً:</b>\n"
-                for idx, (u_data, count) in enumerate(top_users, 1):
-                    name_link = get_user_link(u_data[0], u_data[2]) # u_data[0]=id, u_data[2]=fullname
-                    leaderboard_text += f"{idx}. {name_link} ⇦ {count} دعوة\n"
-
-        text = (
-            f"🎁 <b>نظام الإحالة والمكافآت</b>\n\n"
-            f"شارك الرابط أدناه واربح <b>10 نقاط</b> عن كل صديق!\n\n"
-            f"🔗 رابطك:\n<code>{link}</code>\n"
-            f"{leaderboard_text}"
-        )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="collect_points")]])
-        await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
-
-    # --- المكافأة اليومية ---
-    elif data == "daily_bonus":
-        u_data = db.get_user(user_id)
-        last_bonus = u_data[6] # index 6
-        now = datetime.now()
-        
-        can_claim = True
-        if last_bonus:
-            last_date = datetime.fromisoformat(last_bonus)
-            if now - last_date < timedelta(hours=24):
-                can_claim = False
-                remaining = timedelta(hours=24) - (now - last_date)
-                hours, remainder = divmod(remaining.seconds, 3600)
-                minutes, _ = divmod(remainder, 60)
-        
-        if can_claim:
-            bonus = 5 # قيمة المكافأة
-            db.update_points(user_id, bonus, "bonus")
-            # تحديث وقت آخر مكافأة
-            db.cursor.execute("UPDATE users SET last_daily_bonus = ? WHERE user_id = ?", (now.isoformat(), user_id))
-            db.conn.commit()
-            
-            await query.edit_message_text(
-                f"✅ <b>تم استلام المكافأة!</b>\n🎁 حصلت على {bonus} نقاط.\nعد غداً للمزيد.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="collect_points")]]),
-                parse_mode="HTML"
-            )
-        else:
-            await query.answer(f"⏳ تبقى {hours} ساعة و {minutes} دقيقة للمكافأة القادمة", show_alert=True)
-
-    # --- شراء النقاط ---
-    elif data == "buy_points_menu":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ 5 نجوم (50 نقطة)", callback_data="buy_5"),
-             InlineKeyboardButton("⭐ 10 نجوم (120 نقطة)", callback_data="buy_10")],
-            [InlineKeyboardButton("⭐ 20 (250 نقطة - يدوي)", callback_data="buy_manual_20")],
-            [InlineKeyboardButton("⭐ 50 (مؤبد - يدوي)", callback_data="buy_manual_50")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="collect_points")]
-        ])
-        await query.edit_message_text(
-            "💳 <b>متجر النقاط (Telegram Stars)</b>\n"
-            "اختر الباقة المناسبة للدفع:",
-            reply_markup=kb, parse_mode="HTML"
-        )
     
-    # --- التعليمات اليدوية ---
-    elif data in ["buy_manual_20", "buy_manual_50"]:
-        stars = "20" if "20" in data else "50"
-        reward = "250 نقطة" if "20" in data else "اشتراك مدى الحياة"
-        text = (
-            f"⚠️ <b>شراء يدوي ({stars} نجمة)</b>\n\n"
-            f"للحصول على {reward}، اتبع الخطوات بدقة:\n"
-            f"1️⃣ اضغط على اسم الحساب: @MO_3MK\n"
-            f"2️⃣ أرسل له هدية بقيمة <b>{stars} نجوم</b>.\n"
-            f"3️⃣ انسخ الآيدي الخاص بك: <code>{user_id}</code>\n"
-            f"4️⃣ أرسل الآيدي + صورة الإيصال للمالك.\n\n"
-            "⏳ سيتم الشحن خلال دقائق."
-        )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="buy_points_menu")]])
-        await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
-
-    # --- السجل ---
-    elif data == "history":
-        history = db.get_history(user_id)
-        if not history:
-            msg = "📭 لا توجد عمليات حديثة."
-        else:
-            msg = "📜 <b>آخر 5 عمليات:</b>\n\n"
-            for amount, type_str, details, time_str in history:
-                sign = "+" if amount > 0 else ""
-                msg += f"▪️ <b>{type_str}</b> ({sign}{amount})\n   └ <i>{time_str}</i> | {details}\n\n"
-        
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu")]])
-        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+    if data == "buy_5":
+        stars = 5
+        points = 50
+        title = "5 نجوم (50 نقطة)"
+    elif data == "buy_10":
+        stars = 10
+        points = 120
+        title = "10 نجوم (120 نقطة)"
+    else:
+        return
     
-    # --- الدعم ---
-    elif data == "support":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 مراسلة الدعم", url=f"tg://user?id={ADMIN_ID}")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
-        ])
-        await query.edit_message_text("📞 <b>مركز الدعم الفني</b>\nاضغط الزر أدناه للتحدث مع المطور.", reply_markup=kb, parse_mode="HTML")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 💸 نظام تحويل النقاط (Conversation)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    # إنشاء فاتورة
+    prices = [LabeledPrice(f"{points} نقطة", stars * 100)]  # النجوم بالسنتات
     
-    tax = db.get_setting("tax_percent")
-    await query.edit_message_text(
-        f"💸 <b>تحويل النقاط</b>\n\n"
-        f"⚠️ <b>ملاحظة هامة:</b> سيتم خصم عمولة تشغيلية قدرها <b>{tax}%</b> من المبلغ المحول.\n\n"
-        "👇 أرسل الآن <b>الآيدي (ID)</b> للشخص الذي تريد التحويل له:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="cancel_transfer")]])
-    )
-    return STATE_TRANSFER_ID
-
-async def get_transfer_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        target_id = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text("❌ الآيدي يجب أن يكون أرقاماً فقط.")
-        return STATE_TRANSFER_ID
+        await context.bot.send_invoice(
+            chat_id=user_id,
+            title=title,
+            description=f"شراء {points} نقطة مقابل {stars} نجوم",
+            payload=f"stars_{stars}_{points}_{user_id}",
+            provider_token=PAYMENT_PROVIDER_TOKEN,
+            currency="XTR",  # عملة النجوم
+            prices=prices,
+            start_parameter="stars_payment",
+            need_name=False,
+            need_phone_number=False,
+            need_email=False,
+            need_shipping_address=False
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ حدث خطأ: {str(e)}")
+        logger.error(f"Payment error: {e}")
 
-    if target_id == update.effective_user.id:
-        await update.message.reply_text("❌ لا يمكنك التحويل لنفسك!")
-        return STATE_TRANSFER_ID
-
-    target_user = db.get_user(target_id)
-    if not target_user:
-        await update.message.reply_text("❌ هذا المستخدم غير مسجل في البوت.")
-        return STATE_TRANSFER_ID
-
-    context.user_data['transfer_to'] = target_id
-    context.user_data['target_name'] = target_user[2] # Full name
-
-    await update.message.reply_text(
-        f"✅ تم تحديد المستلم: <b>{target_user[2]}</b>\n"
-        "🔢 أرسل الآن المبلغ المراد تحويله:",
-        parse_mode="HTML"
-    )
-    return STATE_TRANSFER_AMOUNT
-
-async def get_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    try:
-        amount = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text("❌ المبلغ يجب أن يكون رقماً صحيحاً.")
-        return STATE_TRANSFER_AMOUNT
-
-    if amount < 10:
-        await update.message.reply_text("❌ الحد الأدنى للتحويل هو 10 نقاط.")
-        return STATE_TRANSFER_AMOUNT
-
-    user_balance = db.get_user(user_id)[4]
-    if amount > user_balance:
-        await update.message.reply_text(f"❌ رصيدك غير كافٍ. لديك {user_balance} فقط.")
-        return STATE_TRANSFER_AMOUNT
-
-    # الحسابات
-    tax_percent = int(db.get_setting("tax_percent"))
-    tax_amount = int(amount * (tax_percent / 100))
-    final_amount = amount - tax_amount
-    target_id = context.user_data['transfer_to']
-
-    # التنفيذ
-    db.update_points(user_id, -amount, "transfer_out", f"إلى: {target_id}")
-    db.update_points(target_id, final_amount, "transfer_in", f"من: {user_id}")
-
-    # رسالة للمرسل
-    await update.message.reply_text(
-        f"✅ <b>تم التحويل بنجاح!</b>\n"
-        f"📤 المبلغ المخصوم: {amount}\n"
-        f"📉 العمولة ({tax_percent}%): {tax_amount}\n"
-        f"📥 وصل للمستلم: {final_amount}",
-        parse_mode="HTML"
-    )
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
     
-    # رسالة للمستلم (إشعار ذكي)
+    # التحقق من الصحة
+    if not query.invoice_payload.startswith("stars_"):
+        await query.answer(ok=False, error_message="فاتورة غير صالحة")
+        return
+    
+    await query.answer(ok=True)
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.message.successful_payment
+    payload = payment.invoice_payload
+    
     try:
-        sender_link = get_user_link(user_id, update.effective_user.first_name)
-        await context.bot.send_message(
-            target_id,
-            f"💰 <b>حوالة واردة!</b>\nاستلمت <b>{final_amount} نقطة</b> من {sender_link}",
+        # تحليل البايلود: stars_5_50_123456
+        parts = payload.split("_")
+        if len(parts) < 4:
+            return
+        
+        stars = int(parts[1])
+        points = int(parts[2])
+        user_id = int(parts[3])
+        
+        # إضافة النقاط للمستخدم
+        db.update_points(user_id, points, "buy", f"شراء بالنجوم: {stars} نجمة")
+        
+        # تسجيل العملية
+        db.add_star_payment(
+            payment_id=payment.provider_payment_id,
+            user_id=user_id,
+            stars=stars,
+            points=points
+        )
+        
+        # إشعار الأدمن
+        user = update.effective_user
+        admin_msg = (
+            f"💰 <b>عملية شراء ناجحة!</b>\n\n"
+            f"👤 المستخدم: {get_user_link(user.id, user.first_name)}\n"
+            f"🆔 الآيدي: <code>{user.id}</code>\n"
+            f"⭐ النجوم: {stars}\n"
+            f"🎯 النقاط: {points}\n"
+            f"💳 المبلغ: {payment.total_amount / 100} نجوم"
+        )
+        try:
+            await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML")
+        except:
+            pass
+        
+        # تأكيد للمستخدم
+        await update.message.reply_text(
+            f"✅ <b>تمت العملية بنجاح!</b>\n\n"
+            f"تم إضافة <b>{points} نقطة</b> لحسابك.\n"
+            f"شكراً لثقتك!",
             parse_mode="HTML"
         )
-    except:
-        pass
-
-    # العودة للداشبورد
-    await send_dashboard(update, context)
-    return ConversationHandler.END
-
-async def cancel_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("تم الإلغاء")
-    await send_dashboard(update, context, edit=True)
-    return ConversationHandler.END
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🎫 نظام استبدال الأكواد (Conversation)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def start_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🎫 <b>استبدال الكود</b>\n\nأرسل الكود الخاص بك الآن:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="cancel_redeem")]])
-    )
-    return STATE_REDEEM_CODE
-
-async def process_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    user_id = update.effective_user.id
-    
-    result = db.redeem_promo_code(user_id, code)
-    
-    if result == "not_found":
-        await update.message.reply_text("❌ الكود غير صحيح.")
-    elif result == "expired":
-        await update.message.reply_text("❌ الكود منتهي الصلاحية أو تم استخدامه بالكامل.")
-    elif result == "used":
-        await update.message.reply_text("❌ لقد استخدمت هذا الكود مسبقاً.")
-    else:
-        # result is points amount
-        await update.message.reply_text(f"🎉 <b>مبارك!</b>\nتم إضافة <b>{result} نقطة</b> لحسابك.", parse_mode="HTML")
-        await send_dashboard(update, context)
-        return ConversationHandler.END
         
-    return STATE_REDEEM_CODE # Allow retry
-
-async def cancel_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await send_dashboard(update, context, edit=True)
-    return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Payment processing error: {e}")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ⚙️ لوحة تحكم الأدمن (Admin Panel)
+# ⚙️ لوحة تحكم الأدمن المتقدمة (Master Admin Panel)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
         return
     
-    u_count, total_pts, total_tx = db.get_global_stats()
-    leaderboard_status = "✅ مفعل" if db.get_setting("show_leaderboard") == "1" else "❌ معطل"
-    tax = db.get_setting("tax_percent")
+    await query.answer()
+    
+    # الحصول على الإحصائيات
+    users_count, total_points, total_tx, total_stars, last_24h_tx = db.get_global_stats()
+    new_users_today = db.get_new_users_stats(1)
+    new_users_week = db.get_new_users_stats(7)
+    
+    maintenance_status = "🔴 معطل" if db.get_setting("maintenance_mode") == "0" else "🟢 مفعل"
     
     text = (
-        f"⚙️ <b>لوحة التحكم الخاصة</b>\n\n"
-        f"👥 المستخدمين: {u_count}\n"
-        f"💰 النقاط الكلية: {total_pts}\n"
-        f"📊 العمليات: {total_tx}\n"
-        f"🏆 لوحة الشرف: {leaderboard_status}\n"
-        f"📉 الضريبة: {tax}%\n"
+        f"⚙️ <b>لوحة التحكم الشاملة</b>\n\n"
+        f"📊 <b>الإحصائيات:</b>\n"
+        f"• 👥 المستخدمين: {users_count}\n"
+        f"• 📈 مستخدمين اليوم: {new_users_today}\n"
+        f"• 📆 مستخدمين الأسبوع: {new_users_week}\n"
+        f"• 💰 النقاط الكلية: {total_points}\n"
+        f"• ⭐ النجوم المشتراة: {total_stars}\n"
+        f"• 📊 العمليات (24س): {last_24h_tx}\n"
+        f"• 🔧 وضع الصيانة: {maintenance_status}\n\n"
+        f"👇 اختر القسم المطلوب:"
     )
     
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ إنشاء كود", callback_data="admin_create_code")],
-        [InlineKeyboardButton("🏆 تفعيل/تعطيل الشرف", callback_data="admin_toggle_lb")],
+        [InlineKeyboardButton("📢 إدارة القنوات", callback_data="admin_channels"),
+         InlineKeyboardButton("👤 إدارة النقاط", callback_data="admin_points")],
+        [InlineKeyboardButton("⚙️ تعديل الإعدادات", callback_data="admin_settings")],
+        [InlineKeyboardButton("📤 نظام الإذاعة", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("📈 الإحصائيات المتقدمة", callback_data="admin_analytics")],
+        [InlineKeyboardButton("🔧 وضع الصيانة", callback_data="admin_toggle_maintenance")],
         [InlineKeyboardButton("🔙 خروج", callback_data="main_menu")]
     ])
     await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
 
-async def admin_toggle_lb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    current = db.get_setting("show_leaderboard")
-    new_val = "0" if current == "1" else "1"
-    db.set_setting("show_leaderboard", new_val)
-    await admin_panel(update, context)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 📢 إدارة القنوات (Force Join)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def admin_start_create_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    channels = db.get_channels()
+    text = "📢 <b>إدارة القنوات الإجبارية</b>\n\n"
+    
+    if channels:
+        for i, (channel_id, link, active) in enumerate(channels, 1):
+            status = "🟢 مفعل" if active else "🔴 معطل"
+            text += f"{i}. {link} ({channel_id}) - {status}\n"
+    else:
+        text += "لا توجد قنوات مضافة.\n"
+    
+    kb_buttons = [
+        [InlineKeyboardButton("➕ إضافة قناة", callback_data="admin_add_channel")],
+        [InlineKeyboardButton("🔄 تعديل قناة", callback_data="admin_edit_channel")]
+    ]
+    
+    if channels:
+        kb_buttons.append([InlineKeyboardButton("🔧 تفعيل/تعطيل", callback_data="admin_toggle_channel")])
+        kb_buttons.append([InlineKeyboardButton("🗑️ حذف قناة", callback_data="admin_delete_channel")])
+    
+    kb_buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
+    
+    kb = InlineKeyboardMarkup(kb_buttons)
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+async def admin_add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
     await query.edit_message_text(
-        "📝 <b>إنشاء كود جديد</b>\n\n"
-        "أرسل البيانات بالترتيب التالي (كل معلومة في سطر):\n"
-        "<code>اسم_الكود\nعدد_النقاط\nعدد_المستخدمين</code>\n\n"
-        "مثال:\nEID2024\n100\n50",
+        "📝 <b>إضافة قناة جديدة</b>\n\n"
+        "أرسل الآن <b>آيدي القناة</b> (مثال: @channel_name أو -1001234567890):",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="admin_cancel_code")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="admin_channels")]])
     )
-    return STATE_CREATE_CODE
+    return STATE_CHANNEL_ID
 
-async def admin_save_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    try:
-        lines = text.split('\n')
-        if len(lines) < 3: raise ValueError
-        
-        code_name = lines[0].strip()
-        points = int(lines[1].strip())
-        max_users = int(lines[2].strip())
-        
-        if db.create_promo_code(code_name, points, max_users):
-            await update.message.reply_text(
-                f"✅ تم إنشاء الكود بنجاح!\n🎫 الكود: <code>{code_name}</code>", 
-                parse_mode="HTML"
-            )
-        else:
-            await update.message.reply_text("❌ الكود موجود مسبقاً، اختر اسماً آخر.")
-            return STATE_CREATE_CODE
-            
-    except ValueError:
-        await update.message.reply_text("❌ التنسيق خطأ! تأكد من الأسطر والأرقام.")
-        return STATE_CREATE_CODE
+async def admin_get_channel_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channel_id = update.message.text.strip()
+    context.user_data['new_channel_id'] = channel_id
+    
+    await update.message.reply_text(
+        "✅ تم حفظ الآيدي.\n"
+        "الآن أرسل <b>رابط القناة</b> (مثال: https://t.me/channel_name):",
+        parse_mode="HTML"
+    )
+    return STATE_CHANNEL_LINK
 
-    await send_dashboard(update, context)
-    return ConversationHandler.END
-
-async def admin_cancel_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("تم الإلغاء")
+async def admin_get_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channel_link = update.message.text.strip()
+    channel_id = context.user_data['new_channel_id']
+    
+    if db.add_channel(channel_id, channel_link):
+        await update.message.reply_text(f"✅ تمت إضافة القناة بنجاح!\n🆔: {channel_id}\n🔗: {channel_link}")
+    else:
+        await update.message.reply_text("❌ القناة موجودة مسبقاً!")
+    
     await admin_panel(update, context)
     return ConversationHandler.END
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 👤 إدارة النقاط (Points Manager)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def admin_points_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "👤 <b>إدارة نقاط المستخدمين</b>\n\n"
+        "أرسل الآن <b>آيدي المستخدم</b> أو <b>اسم المستخدم</b> (بدون @):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel")]])
+    )
+    return STATE_USER_SEARCH
+
+async def admin_search_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    search_input = update.message.text.strip()
+    
+    try:
+        # محاولة البحث بالآيدي
+        user_id = int(search_input)
+        user = db.get_user(user_id)
+    except ValueError:
+        # البحث باسم المستخدم
+        if search_input.startswith("@"):
+            search_input = search_input[1:]
+        user = db.get_user_by_username(search_input)
+    
+    if not user:
+        await update.message.reply_text("❌ المستخدم غير موجود!")
+        return STATE_USER_SEARCH
+    
+    context.user_data['managed_user'] = user[0]  # user_id
+    context.user_data['managed_user_name'] = user[2]  # full_name
+    
+    text = (
+        f"✅ <b>تم العثور على المستخدم:</b>\n\n"
+        f"👤 الاسم: {user[2]}\n"
+        f"🆔 الآيدي: <code>{user[0]}</code>\n"
+        f"📛 اليوزر: @{user[1] or 'لا يوجد'}\n"
+        f"💰 النقاط: {user[4]}\n"
+        f"📅 تاريخ التسجيل: {user[7][:10]}\n"
+        f"🚫 الحالة: {'محظور' if user[8] == 1 else 'نشط'}"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ إضافة نقاط", callback_data="admin_add_points"),
+         InlineKeyboardButton("➖ خصم نقاط", callback_data="admin_deduct_points")],
+        [InlineKeyboardButton("🚫 حظر", callback_data="admin_ban_user"),
+         InlineKeyboardButton("✅ فك الحظر", callback_data="admin_unban_user")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]
+    ])
+    
+    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+    return STATE_USER_MANAGE
+
+async def admin_add_points_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['action'] = 'add'
+    await query.edit_message_text(
+        "💰 <b>إضافة نقاط</b>\n\n"
+        "أرسل عدد النقاط التي تريد إضافتها:",
+        parse_mode="HTML"
+    )
+    return STATE_USER_MANAGE
+
+async def admin_deduct_points_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['action'] = 'deduct'
+    await query.edit_message_text(
+        "💰 <b>خصم نقاط</b>\n\n"
+        "أرسل عدد النقاط التي تريد خصمها:",
+        parse_mode="HTML"
+    )
+    return STATE_USER_MANAGE
+
+async def admin_process_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = int(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ الرقم غير صالح!")
+        return STATE_USER_MANAGE
+    
+    user_id = context.user_data['managed_user']
+    user_name = context.user_data['managed_user_name']
+    action = context.user_data.get('action')
+    
+    if action == 'add':
+        db.update_points(user_id, amount, "admin_add", f"إضافة من الأدمن")
+        message = f"✅ تم إضافة {amount} نقطة للمستخدم {user_name}"
+    elif action == 'deduct':
+        db.update_points(user_id, -amount, "admin_deduct", f"خصم من الأدمن")
+        message = f"✅ تم خصم {amount} نقطة من المستخدم {user_name}"
+    else:
+        await update.message.reply_text("❌ حدث خطأ!")
+        return
+    
+    await update.message.reply_text(message)
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_ban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = context.user_data['managed_user']
+    user_name = context.user_data['managed_user_name']
+    
+    db.ban_user(user_id)
+    
+    await query.edit_message_text(f"✅ تم حظر المستخدم {user_name}")
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_unban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = context.user_data['managed_user']
+    user_name = context.user_data['managed_user_name']
+    
+    db.unban_user(user_id)
+    
+    await query.edit_message_text(f"✅ تم فك حظر المستخدم {user_name}")
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ⚙️ تعديل الإعدادات (Global Settings)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def admin_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    tax = db.get_setting("tax_percent")
+    daily_bonus = db.get_setting("daily_bonus_amount")
+    referral_points = db.get_setting("referral_points")
+    min_transfer = db.get_setting("min_transfer")
+    welcome_points = db.get_setting("welcome_points")
+    
+    text = (
+        f"⚙️ <b>الإعدادات العامة</b>\n\n"
+        f"📊 <b>الإعدادات الحالية:</b>\n"
+        f"• 📉 نسبة الضريبة: {tax}%\n"
+        f"• 🎁 المكافأة اليومية: {daily_bonus} نقطة\n"
+        f"• 👥 نقاط الإحالة: {referral_points} نقطة\n"
+        f"• 💸 الحد الأدنى للتحويل: {min_transfer} نقطة\n"
+        f"• 👋 نقاط الترحيب: {welcome_points} نقطة\n\n"
+        f"اختر الإعداد الذي تريد تعديله:"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📉 نسبة الضريبة", callback_data="admin_set_tax"),
+         InlineKeyboardButton("🎁 المكافأة اليومية", callback_data="admin_set_daily")],
+        [InlineKeyboardButton("👥 نقاط الإحالة", callback_data="admin_set_referral"),
+         InlineKeyboardButton("💸 حد التحويل", callback_data="admin_set_min")],
+        [InlineKeyboardButton("👋 نقاط الترحيب", callback_data="admin_set_welcome")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+    return STATE_SETTINGS_MENU
+
+async def admin_change_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    
+    setting_map = {
+        "admin_set_tax": ("tax_percent", "📉 نسبة الضريبة", "نسبة مئوية"),
+        "admin_set_daily": ("daily_bonus_amount", "🎁 المكافأة اليومية", "نقاط"),
+        "admin_set_referral": ("referral_points", "👥 نقاط الإحالة", "نقاط"),
+        "admin_set_min": ("min_transfer", "💸 الحد الأدنى للتحويل", "نقاط"),
+        "admin_set_welcome": ("welcome_points", "👋 نقاط الترحيب", "نقاط")
+    }
+    
+    if data not in setting_map:
+        return
+    
+    key, name, unit = setting_map[data]
+    context.user_data['setting_to_change'] = key
+    
+    await query.edit_message_text(
+        f"⚙️ <b>تعديل {name}</b>\n\n"
+        f"أرسل القيمة الجديدة ({unit}):",
+        parse_mode="HTML"
+    )
+    return STATE_SETTINGS_MENU
+
+async def admin_save_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        value = int(update.message.text.strip())
+        if value < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ القيمة غير صالحة! يجب أن تكون رقماً موجباً.")
+        return STATE_SETTINGS_MENU
+    
+    key = context.user_data['setting_to_change']
+    db.set_setting(key, str(value))
+    
+    await update.message.reply_text(f"✅ تم تحديث الإعداد بنجاح!")
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 📤 نظام الإذاعة المتطور (Advanced Broadcast)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    text = (
+        "📤 <b>نظام الإذاعة المتطور</b>\n\n"
+        "يمكنك إرسال رسالة لجميع المستخدمين مع خيارات متقدمة:\n"
+        "1. 📝 نص فقط\n"
+        "2. 🖼️ صورة مع نص\n"
+        "3. 🎬 فيديو مع نص\n"
+        "4. 📁 ملف مع نص\n\n"
+        "مع إمكانية تثبيت الرسالة عند المستخدمين!"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 إذاعة نصية", callback_data="broadcast_text")],
+        [InlineKeyboardButton("🖼️ إذاعة بالصورة", callback_data="broadcast_photo")],
+        [InlineKeyboardButton("🎬 إذاعة بالفيديو", callback_data="broadcast_video")],
+        [InlineKeyboardButton("📁 إذاعة بملف", callback_data="broadcast_document")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+async def admin_start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    
+    media_type = data.replace("broadcast_", "")
+    context.user_data['broadcast_media'] = media_type
+    
+    await query.edit_message_text(
+        "📝 <b>إرسال الرسالة</b>\n\n"
+        "أرسل الآن نص الرسالة:\n"
+        "(يمكنك استخدام HTML للتنسيق)",
+        parse_mode="HTML"
+    )
+    return STATE_BROADCAST_MESSAGE
+
+async def admin_get_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message.text
+    context.user_data['broadcast_message'] = message
+    
+    media_type = context.user_data['broadcast_media']
+    
+    if media_type == "text":
+        # مباشرة للإرسال
+        await admin_send_broadcast(update, context)
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            f"✅ تم حفظ النص.\n"
+            f"الآن أرسل الـ{media_type}:\n"
+            f"(الصورة / الفيديو / الملف)"
+        )
+        return STATE_BROADCAST_MEDIA
+
+async def admin_get_broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    media_type = context.user_data['broadcast_media']
+    
+    if media_type == "photo" and update.message.photo:
+        context.user_data['broadcast_file_id'] = update.message.photo[-1].file_id
+    elif media_type == "video" and update.message.video:
+        context.user_data['broadcast_file_id'] = update.message.video.file_id
+    elif media_type == "document" and update.message.document:
+        context.user_data['broadcast_file_id'] = update.message.document.file_id
+    else:
+        await update.message.reply_text("❌ نوع الملف غير صحيح!")
+        return STATE_BROADCAST_MEDIA
+    
+    # سؤال عن التثبيت
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ نعم، ثبت الرسالة", callback_data="broadcast_pin_yes"),
+         InlineKeyboardButton("❌ لا، لا تثبت", callback_data="broadcast_pin_no")]
+    ])
+    
+    await update.message.reply_text(
+        "📌 هل تريد تثبيت الرسالة عند المستخدمين؟",
+        reply_markup=kb
+    )
+    return ConversationHandler.END
+
+async def admin_send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query if update.callback_query else None
+    
+    message = context.user_data.get('broadcast_message', '')
+    media_type = context.user_data.get('broadcast_media', 'text')
+    file_id = context.user_data.get('broadcast_file_id')
+    
+    # تحديد إذا كان تثبيت
+    pin_message = False
+    if query and query.data == "broadcast_pin_yes":
+        pin_message = True
+    
+    # الحصول على جميع المستخدمين
+    all_users = db.get_all_users()
+    total_users = len(all_users)
+    
+    if total_users == 0:
+        if query:
+            await query.edit_message_text("❌ لا يوجد مستخدمين لإرسال الرسالة لهم!")
+        else:
+            await update.message.reply_text("❌ لا يوجد مستخدمين لإرسال الرسالة لهم!")
+        return ConversationHandler.END
+    
+    # إعداد الرسالة التقدمية
+    if query:
+        progress_msg = await query.edit_message_text("⏳ جاري إرسال الرسالة...\n0% (0/{})".format(total_users))
+    else:
+        progress_msg = await update.message.reply_text("⏳ جاري إرسال الرسالة...\n0% (0/{})".format(total_users))
+    
+    sent_count = 0
+    failed_count = 0
+    failed_users = []
+    
+    # إرسال الرسالة لكل مستخدم
+    for i, (user_id, username, full_name, points) in enumerate(all_users, 1):
+        try:
+            if media_type == "text":
+                msg = await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode="HTML"
+                )
+                if pin_message:
+                    await context.bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
+                    
+            elif media_type == "photo":
+                msg = await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=file_id,
+                    caption=message,
+                    parse_mode="HTML"
+                )
+                if pin_message:
+                    await context.bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
+                    
+            elif media_type == "video":
+                msg = await context.bot.send_video(
+                    chat_id=user_id,
+                    video=file_id,
+                    caption=message,
+                    parse_mode="HTML"
+                )
+                if pin_message:
+                    await context.bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
+                    
+            elif media_type == "document":
+                msg = await context.bot.send_document(
+                    chat_id=user_id,
+                    document=file_id,
+                    caption=message,
+                    parse_mode="HTML"
+                )
+                if pin_message:
+                    await context.bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
+            
+            sent_count += 1
+            
+        except Exception as e:
+            failed_count += 1
+            failed_users.append(f"{full_name} ({user_id}) - {str(e)}")
+        
+        # تحديث الرسالة التقدمية كل 10 مستخدمين
+        if i % 10 == 0 or i == total_users:
+            progress = int((i / total_users) * 100)
+            await progress_msg.edit_text(
+                f"⏳ جاري إرسال الرسالة...\n"
+                f"{progress}% ({i}/{total_users})\n"
+                f"✅ تم إرسال: {sent_count}\n"
+                f"❌ فشل: {failed_count}"
+            )
+    
+    # تسجيل الإذاعة في قاعدة البيانات
+    db.add_broadcast(
+        message=message[:100],  # تخزين أول 100 حرف فقط
+        media_type=media_type,
+        sent_to=sent_count,
+        failed_to=failed_count,
+        pinned=1 if pin_message else 0
+    )
+    
+    # عرض النتائج النهائية
+    result_text = (
+        f"📊 <b>نتائج الإذاعة:</b>\n\n"
+        f"✅ تم الإرسال بنجاح: {sent_count}\n"
+        f"❌ فشل في الإرسال: {failed_count}\n"
+        f"📌 تم التثبيت: {'نعم' if pin_message else 'لا'}\n\n"
+    )
+    
+    if failed_users and failed_count <= 10:  # عرض فقط إذا كانوا قليلين
+        result_text += "<b>المستخدمين الذين فشل الإرسال لهم:</b>\n"
+        for user_info in failed_users[:10]:
+            result_text += f"• {user_info}\n"
+    
+    await progress_msg.edit_text(result_text, parse_mode="HTML")
+    
+    # تنظيف البيانات المؤقتة
+    context.user_data.pop('broadcast_message', None)
+    context.user_data.pop('broadcast_media', None)
+    context.user_data.pop('broadcast_file_id', None)
+    
+    return ConversationHandler.END
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 📈 الإحصائيات المتقدمة (Deep Analytics)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def admin_analytics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    # الحصول على الإحصائيات
+    users_count, total_points, total_tx, total_stars, last_24h_tx = db.get_global_stats()
+    new_users_today = db.get_new_users_stats(1)
+    new_users_week = db.get_new_users_stats(7)
+    
+    # أكثر 10 مستخدمين غنى
+    rich_users = db.get_top_rich_users(10)
+    
+    # الحصول على أعلى المشيرين
+    top_referrers = db.get_top_referrers(5)
+    
+    text = (
+        f"📈 <b>الإحصائيات المتقدمة</b>\n\n"
+        f"📊 <b>النظرة العامة:</b>\n"
+        f"• 👥 إجمالي المستخدمين: {users_count}\n"
+        f"• 📈 مستخدمين اليوم: {new_users_today}\n"
+        f"• 📆 مستخدمين الأسبوع: {new_users_week}\n"
+        f"• 💰 النقاط الكلية: {total_points}\n"
+        f"• ⭐ النجوم المشتراة: {total_stars}\n"
+        f"• 📊 العمليات (24س): {last_24h_tx}\n\n"
+    )
+    
+    # عرض الأغنياء
+    if rich_users:
+        text += f"🏆 <b>أكثر 10 مستخدمين ثراءً:</b>\n"
+        for i, (user_id, username, full_name, points) in enumerate(rich_users, 1):
+            name_display = full_name or username or f"User {user_id}"
+            text += f"{i}. {name_display[:20]} - {points:,} نقطة\n"
+        text += "\n"
+    
+    # عرض أفضل المشيرين
+    if top_referrers:
+        text += f"👥 <b>أفضل 5 مشيرين:</b>\n"
+        for i, (user_data, count) in enumerate(top_referrers, 1):
+            name_display = user_data[2] or user_data[1] or f"User {user_data[0]}"
+            text += f"{i}. {name_display[:20]} - {count} إحالة\n"
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data="admin_analytics")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🔧 وضع الصيانة (Maintenance Mode)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def admin_toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    current = db.get_setting("maintenance_mode")
+    new_val = "0" if current == "1" else "1"
+    db.set_setting("maintenance_mode", new_val)
+    
+    status = "مفعل" if new_val == "1" else "معطل"
+    await query.edit_message_text(f"✅ تم {status} وضع الصيانة.")
+    
+    # إذا تم تفعيل وضع الصيانة، إرسال إشعار لجميع المستخدمين النشطين
+    if new_val == "1":
+        all_users = db.get_all_users()
+        for user_id, _, full_name, _ in all_users:
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    "🔧 <b>إشعار هام</b>\n\n"
+                    "البوت سيدخل في وضع الصيانة لفترة قصيرة.\n"
+                    "سيعود للعمل قريبًا بإذن الله.\n"
+                    "شكرًا لتفهمكم.",
+                    parse_mode="HTML"
+                )
+                time.sleep(0.1)  # لتجنب حظر التلغرام
+            except:
+                continue
+    
+    await admin_panel(update, context)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🔌 التشغيل الرئيسي (Main Execution)
@@ -678,6 +1193,24 @@ async def admin_cancel_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # التحقق من وضع الصيانة قبل أي أمر
+    async def maintenance_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if check_maintenance_mode(user_id) and user_id != ADMIN_ID:
+            if update.message:
+                await update.message.reply_text(
+                    "🔧 البوت قيد الصيانة حاليًا.\n"
+                    "سيتم فتحه قريبًا بإذن الله.\n"
+                    "شكرًا لتفهمكم."
+                )
+            elif update.callback_query:
+                await update.callback_query.answer("البوت قيد الصيانة حالياً", show_alert=True)
+            return True
+        return False
+    
+    # إضافة middleware للتحقق من الصيانة
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maintenance_check), group=-1)
 
     # Conversation: Transfer Points
     transfer_conv = ConversationHandler(
@@ -707,23 +1240,97 @@ def main():
         fallbacks=[CallbackQueryHandler(admin_cancel_code, pattern="^admin_cancel_code$")]
     )
 
+    # Conversation: إدارة القنوات
+    channels_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_add_channel_start, pattern="^admin_add_channel$")],
+        states={
+            STATE_CHANNEL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_get_channel_id)],
+            STATE_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_get_channel_link)]
+        },
+        fallbacks=[CallbackQueryHandler(admin_channels_menu, pattern="^admin_channels$")]
+    )
+
+    # Conversation: إدارة النقاط
+    points_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_points_menu, pattern="^admin_points$")],
+        states={
+            STATE_USER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user)],
+            STATE_USER_MANAGE: [
+                CallbackQueryHandler(admin_add_points_callback, pattern="^admin_add_points$"),
+                CallbackQueryHandler(admin_deduct_points_callback, pattern="^admin_deduct_points$"),
+                CallbackQueryHandler(admin_ban_user_callback, pattern="^admin_ban_user$"),
+                CallbackQueryHandler(admin_unban_user_callback, pattern="^admin_unban_user$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_process_points)
+            ]
+        },
+        fallbacks=[CallbackQueryHandler(admin_panel, pattern="^admin_panel$")]
+    )
+
+    # Conversation: تعديل الإعدادات
+    settings_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_settings_menu, pattern="^admin_settings$")],
+        states={
+            STATE_SETTINGS_MENU: [
+                CallbackQueryHandler(admin_change_setting, pattern="^admin_set_(tax|daily|referral|min|welcome)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_setting)
+            ]
+        },
+        fallbacks=[CallbackQueryHandler(admin_panel, pattern="^admin_panel$")]
+    )
+
+    # Conversation: الإذاعة المتطورة
+    broadcast_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_start_broadcast, pattern="^broadcast_(text|photo|video|document)$")
+        ],
+        states={
+            STATE_BROADCAST_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_get_broadcast_message)],
+            STATE_BROADCAST_MEDIA: [
+                MessageHandler(filters.PHOTO, admin_get_broadcast_media),
+                MessageHandler(filters.VIDEO, admin_get_broadcast_media),
+                MessageHandler(filters.Document.ALL, admin_get_broadcast_media)
+            ]
+        },
+        fallbacks=[
+            CallbackQueryHandler(admin_send_broadcast, pattern="^broadcast_pin_(yes|no)$"),
+            CallbackQueryHandler(admin_broadcast_menu, pattern="^admin_broadcast$")
+        ]
+    )
+
     # Handlers Registration
     application.add_handler(CommandHandler("start", start))
-        
+    
+    # نظام الدفع بالنجوم
+    if PAYMENT_PROVIDER_TOKEN:
+        application.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+        application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    
     # Register Conversations
     application.add_handler(transfer_conv)
     application.add_handler(redeem_conv)
     application.add_handler(create_code_conv)
+    application.add_handler(channels_conv)
+    application.add_handler(points_conv)
+    application.add_handler(settings_conv)
+    application.add_handler(broadcast_conv)
     
     # Callback Handlers (General & Admin)
     application.add_handler(CallbackQueryHandler(main_callback_handler, pattern="^(main_menu|attack_menu|collect_points|referral_page|daily_bonus|buy_points_menu|buy_manual_.*|history|support)$"))
     application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
     application.add_handler(CallbackQueryHandler(admin_toggle_lb, pattern="^admin_toggle_lb$"))
-
-    # Invoice Placeholders (للدفع التلقائي مستقبلاً)
-    # application.add_handler(CallbackQueryHandler(buy_stars_handler, pattern="^buy_(5|10)$"))
+    application.add_handler(CallbackQueryHandler(admin_toggle_maintenance, pattern="^admin_toggle_maintenance$"))
+    application.add_handler(CallbackQueryHandler(admin_channels_menu, pattern="^admin_channels$"))
+    application.add_handler(CallbackQueryHandler(admin_broadcast_menu, pattern="^admin_broadcast$"))
+    application.add_handler(CallbackQueryHandler(admin_analytics_menu, pattern="^admin_analytics$"))
+    
+    # معالجات الدفع بالنجوم (إذا كان توكن الدفع متوفراً)
+    if PAYMENT_PROVIDER_TOKEN:
+        application.add_handler(CallbackQueryHandler(buy_stars_handler, pattern="^buy_(5|10)$"))
 
     print(f"🤖 البوت يعمل بكفاءة عالية... (Admin: {ADMIN_ID})")
+    print(f"🔧 وضع الصيانة: {'مفعل' if db.get_setting('maintenance_mode') == '1' else 'معطل'}")
+    print(f"⭐ نظام الدفع: {'مفعل' if PAYMENT_PROVIDER_TOKEN else 'معطل'}")
+    
     application.run_polling()
 
 if __name__ == "__main__":
