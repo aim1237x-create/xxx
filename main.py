@@ -3,13 +3,14 @@ import sqlite3
 import html
 import time
 import asyncio
+import os
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Dict, Any, Union
 import json
 import aiosqlite
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as ThreadTimeoutError
+from concurrent.futures import ThreadPoolExecutor
 import threading
-import queue
+from collections import defaultdict
 
 from telegram import (
     Update,
@@ -32,16 +33,22 @@ from telegram.ext import (
     ConversationHandler,
     CallbackContext
 )
+from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ⚙️ إعدادات البوت والتهيئة المحسنة
+# ⚙️ إعدادات البوت والتهيئة المحسنة - القراءة من متغيرات البيئة
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-BOT_TOKEN = "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk"
-ADMIN_ID = 8287678319
-PAYMENT_PROVIDER_TOKEN = ""
+# قراءة التوكنات من متغيرات البيئة مع قيم افتراضية للتجربة
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk")
+ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "8287678319"))
+PAYMENT_PROVIDER_TOKEN = os.getenv("TELEGRAM_PAYMENT_TOKEN", "")
 
-# مراحل المحادثات (Conversation States) - إصلاح التضارب وتحسين النظام
+# ⚠️ تحذير: يجب تعيين التوكنات الفعلية في متغيرات البيئة في الإنتاج
+if BOT_TOKEN == "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk":
+    print("⚠️ تحذير: يتم استخدام التوكن الافتراضي. غير آمن للإنتاج!")
+
+# مراحل المحادثات (Conversation States)
 STATE_TRANSFER_ID, STATE_TRANSFER_AMOUNT = range(2)
 STATE_REDEEM_CODE = 2
 STATE_CREATE_CODE = 3
@@ -57,10 +64,11 @@ STATE_ADMIN_REPLY = 15
 STATE_CODE_EXPIRY = 16
 STATE_POINTS_AMOUNT = 17
 STATE_CONFIRM_ACTION = 18
+STATE_ADD_POINTS, STATE_DEDUCT_POINTS = range(19, 21)
 
 # إعدادات التحقق من القنوات
-CHECK_CHANNELS_INTERVAL = 300  # 5 دقائق
-CHANNEL_CHECK_TIMEOUT = 10  # ثواني
+CHECK_CHANNELS_INTERVAL = 300
+CHANNEL_CHECK_TIMEOUT = 10
 
 # إعدادات نظام الإذاعة المحسنة
 BROADCAST_DELAY_MIN = 0.1
@@ -69,11 +77,14 @@ BROADCAST_BATCH_SIZE = 30
 BROADCAST_BATCH_DELAY = 1.0
 
 # إعدادات نظام التخزين المؤقت
-CACHE_TTL = 60  # ثانية واحدة للتخزين المؤقت
+CACHE_TTL = 120  # 2 دقائق للتخزين المؤقت
 
-# الحد الأقصى للمحاولات في المحادثات
-MAX_RETRIES = 3
-CONVERSATION_TIMEOUT = 300  # 5 دقائق لتايمآوت المحادثة
+# نظام Rate Limiting
+RATE_LIMIT_WINDOW = 1  # ثانية واحدة
+MAX_REQUESTS_PER_WINDOW = 5  # 5 طلبات في الثانية
+
+# التحقق من الاتصال
+DATABASE_CONNECTION_TIMEOUT = 30
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -82,7 +93,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🗄️ نظام قاعدة البيانات المتقدم (Advanced Database Manager)
+# 🗄️ نظام قاعدة البيانات المتقدم مع Connection Pool وWAL Mode
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class AsyncDatabaseManager:
@@ -90,23 +101,33 @@ class AsyncDatabaseManager:
         self.db_name = db_name
         self.connection_pool = []
         self.pool_size = 5
-        self.lock = threading.Lock()
+        self.pool_lock = threading.Lock()
         self.cache = {}
         self.cache_timestamps = {}
-        self.executor = ThreadPoolExecutor(max_workers=10)
+        self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="DBThread")
         self.init_database_sync()
+        self.user_last_activity = {}
+        self.rate_limit_data = defaultdict(list)
         
     def init_database_sync(self):
-        """تهيئة قاعدة البيانات بشكل متزامن مع تحسينات متقدمة"""
+        """تهيئة قاعدة البيانات بشكل متزامن مع WAL Mode"""
         try:
             conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=30)
             cursor = conn.cursor()
+            
+            # تفعيل WAL Mode لمنع مشاكل القفل
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA cache_size=-2000")  # 2MB cache
+            cursor.execute("PRAGMA foreign_keys=ON")
+            
             self.create_tables_sync(cursor)
             self.create_indices_sync(cursor)
             self.init_settings_sync(cursor)
+            
             conn.commit()
             conn.close()
-            logger.info("✅ قاعدة البيانات مهيأة بنجاح مع تحسينات متقدمة")
+            logger.info("✅ قاعدة البيانات مهيأة بنجاح مع WAL Mode")
         except Exception as e:
             logger.error(f"❌ خطأ في تهيئة قاعدة البيانات: {e}")
             raise
@@ -134,6 +155,9 @@ class AsyncDatabaseManager:
                 language TEXT DEFAULT 'ar',
                 privacy_level INTEGER DEFAULT 1,
                 last_channel_check TEXT,
+                is_active INTEGER DEFAULT 1,
+                rate_limit_count INTEGER DEFAULT 0,
+                last_rate_limit_reset TEXT,
                 FOREIGN KEY (referrer_id) REFERENCES users(user_id)
             )
             ''',
@@ -209,7 +233,8 @@ class AsyncDatabaseManager:
                 last_check TEXT,
                 required_subscription INTEGER DEFAULT 1,
                 channel_name TEXT,
-                member_count INTEGER DEFAULT 0
+                member_count INTEGER DEFAULT 0,
+                bot_is_admin INTEGER DEFAULT 0
             )
             ''',
             
@@ -365,6 +390,17 @@ class AsyncDatabaseManager:
                 FOREIGN KEY (sender_id) REFERENCES users(user_id),
                 FOREIGN KEY (receiver_id) REFERENCES users(user_id)
             )
+            ''',
+            
+            # جدول Rate Limiting
+            '''
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id INTEGER PRIMARY KEY,
+                request_count INTEGER DEFAULT 0,
+                last_reset TEXT,
+                warning_count INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
             '''
         ]
         
@@ -432,7 +468,10 @@ class AsyncDatabaseManager:
             ("enable_daily_bonus", "1", "تفعيل المكافأة اليومية", "boolean", "0,1"),
             ("enable_referral_system", "1", "تفعيل نظام الإحالة", "boolean", "0,1"),
             ("auto_cleanup_days", "90", "عدد أيام الاحتفاظ بالسجلات", "integer", "30,365"),
-            ("backup_interval_hours", "24", "فترة النسخ الاحتياطي بالساعات", "integer", "6,168")
+            ("backup_interval_hours", "24", "فترة النسخ الاحتياطي بالساعات", "integer", "6,168"),
+            ("rate_limit_enabled", "1", "تفعيل نظام Rate Limiting", "boolean", "0,1"),
+            ("inactive_user_days", "30", "عدد أيام عدم النشاط للحساب غير الفعال", "integer", "7,365"),
+            ("max_points_per_user", "1000000", "الحد الأقصى للنقاط للمستخدم الواحد", "integer", "10000,10000000")
         ]
         
         for key, val, desc, data_type, options in default_settings:
@@ -445,21 +484,30 @@ class AsyncDatabaseManager:
                 logger.error(f"خطأ في إضافة الإعداد: {e}")
     
     async def get_connection(self):
-        """الحصول على اتصال من البركة (Connection Pool)"""
-        async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+        """الحصول على اتصال من البركة مع إدارة الأخطاء"""
+        try:
+            conn = await aiosqlite.connect(self.db_name, timeout=DATABASE_CONNECTION_TIMEOUT)
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.execute("PRAGMA foreign_keys=ON")
             conn.row_factory = aiosqlite.Row
             return conn
+        except Exception as e:
+            logger.error(f"❌ خطأ في إنشاء اتصال قاعدة البيانات: {e}")
+            raise
     
-    async def execute_query(self, query: str, params: tuple = (), commit: bool = False, use_cache: bool = False, cache_key: str = None):
-        """تنفيذ استعلام بأمان مع دعم التخزين المؤقت"""
+    async def execute_query(self, query: str, params: tuple = (), commit: bool = False, 
+                          use_cache: bool = False, cache_key: str = None, retry_count: int = 0):
+        """تنفيذ استعلام بأمان مع إعادة المحاولة"""
         if use_cache and cache_key:
             cached_data = self.get_cached_data(cache_key)
             if cached_data is not None:
                 return cached_data
         
+        max_retries = 3
         try:
-            async with aiosqlite.connect(self.db_name, timeout=30) as conn:
-                conn.row_factory = aiosqlite.Row
+            conn = await self.get_connection()
+            async with conn:
                 async with conn.execute(query, params) as cursor:
                     result = await cursor.fetchall()
                     if commit:
@@ -469,33 +517,40 @@ class AsyncDatabaseManager:
                         self.set_cached_data(cache_key, result)
                     
                     return result
-        except aiosqlite.Error as e:
-            logger.error(f"خطأ في قاعدة البيانات: {e} - الاستعلام: {query}")
+        except aiosqlite.OperationalError as e:
+            if "database is locked" in str(e) and retry_count < max_retries:
+                await asyncio.sleep(0.1 * (retry_count + 1))
+                return await self.execute_query(query, params, commit, use_cache, cache_key, retry_count + 1)
+            logger.error(f"❌ خطأ في قاعدة البيانات: {e} - الاستعلام: {query[:100]}")
+            raise
+        except Exception as e:
+            logger.error(f"❌ خطأ في قاعدة البيانات: {e} - الاستعلام: {query[:100]}")
             raise
     
     async def execute_query_one(self, query: str, params: tuple = (), commit: bool = False):
         """تنفيذ استعلام وإرجاع صف واحد"""
         try:
-            async with aiosqlite.connect(self.db_name, timeout=30) as conn:
-                conn.row_factory = aiosqlite.Row
+            conn = await self.get_connection()
+            async with conn:
                 async with conn.execute(query, params) as cursor:
                     result = await cursor.fetchone()
                     if commit:
                         await conn.commit()
                     return result
-        except aiosqlite.Error as e:
-            logger.error(f"خطأ في قاعدة البيانات: {e} - الاستعلام: {query}")
+        except Exception as e:
+            logger.error(f"❌ خطأ في قاعدة البيانات: {e} - الاستعلام: {query[:100]}")
             raise
     
     async def execute_update(self, query: str, params: tuple = ()):
         """تنفيذ استعلام تحديث"""
         try:
-            async with aiosqlite.connect(self.db_name, timeout=30) as conn:
+            conn = await self.get_connection()
+            async with conn:
                 async with conn.execute(query, params) as cursor:
                     await conn.commit()
                     return cursor.rowcount
-        except aiosqlite.Error as e:
-            logger.error(f"خطأ في قاعدة البيانات: {e} - الاستعلام: {query}")
+        except Exception as e:
+            logger.error(f"❌ خطأ في قاعدة البيانات: {e} - الاستعلام: {query[:100]}")
             raise
     
     # --- نظام التخزين المؤقت ---
@@ -507,7 +562,6 @@ class AsyncDatabaseManager:
             if time.time() - timestamp < CACHE_TTL:
                 return self.cache[key]
             else:
-                # تنظيف البيانات المنتهية
                 del self.cache[key]
                 del self.cache_timestamps[key]
         return None
@@ -528,13 +582,59 @@ class AsyncDatabaseManager:
             self.cache.clear()
             self.cache_timestamps.clear()
     
+    # --- نظام Rate Limiting المتقدم ---
+    
+    async def check_rate_limit(self, user_id: int) -> tuple:
+        """التحقق من Rate Limiting مع تحديث قاعدة البيانات"""
+        try:
+            if not await self.get_setting("rate_limit_enabled", 1):
+                return True, ""
+            
+            now = time.time()
+            window_start = now - RATE_LIMIT_WINDOW
+            
+            # تنظيف البيانات القديمة
+            self.rate_limit_data[user_id] = [t for t in self.rate_limit_data[user_id] if t > window_start]
+            
+            # إضافة الطلب الحالي
+            self.rate_limit_data[user_id].append(now)
+            
+            # التحقق من الحد
+            if len(self.rate_limit_data[user_id]) > MAX_REQUESTS_PER_WINDOW:
+                # تحديث تحذيرات المستخدم في قاعدة البيانات
+                await self.execute_update(
+                    "UPDATE users SET warnings = warnings + 1 WHERE user_id = ?",
+                    (user_id,)
+                )
+                
+                # تسجيل النشاط
+                await self.execute_update(
+                    """INSERT INTO bot_activities 
+                    (activity_type, user_id, details, timestamp) 
+                    VALUES (?, ?, ?, ?)""",
+                    ("rate_limit_exceeded", user_id, f"تجاوز حد الطلبات: {len(self.rate_limit_data[user_id])} طلب", datetime.now().isoformat())
+                )
+                
+                remaining_time = RATE_LIMIT_WINDOW - (now - self.rate_limit_data[user_id][0])
+                return False, f"⏱️ تجاوزت الحد المسموح. يرجى الانتظار {remaining_time:.1f} ثانية"
+            
+            return True, ""
+        except Exception as e:
+            logger.error(f"خطأ في نظام Rate Limiting: {e}")
+            return True, ""  # في حالة الخطأ، نسمح بالطلب
+    
+    async def reset_rate_limit(self, user_id: int):
+        """إعادة تعيين Rate Limiting للمستخدم"""
+        if user_id in self.rate_limit_data:
+            self.rate_limit_data[user_id] = []
+    
     # --- عمليات المستخدم المتقدمة ---
     
     async def add_user(self, user_id: int, username: str, full_name: str, phone: str = "None", referrer_id: int = None) -> bool:
         """إضافة مستخدم جديد بأمان مع معاملات متقدمة"""
         try:
-            async with aiosqlite.connect(self.db_name, timeout=30) as conn:
-                conn.row_factory = aiosqlite.Row
+            conn = await self.get_connection()
+            async with conn:
                 await conn.execute("BEGIN TRANSACTION")
                 
                 # التحقق من عدم وجود المستخدم مسبقاً
@@ -631,7 +731,7 @@ class AsyncDatabaseManager:
                 """SELECT user_id, username, full_name, phone, points, referrer_id, 
                 last_daily_bonus, joined_date, is_banned, last_active, 
                 total_earned, total_spent, warnings, subscription_checked,
-                language, privacy_level, last_channel_check
+                language, privacy_level, last_channel_check, is_active
                 FROM users WHERE user_id = ?""",
                 (user_id,)
             )
@@ -647,8 +747,8 @@ class AsyncDatabaseManager:
     async def update_points(self, user_id: int, amount: int, reason: str, details: str = "", related_user_id: int = None):
         """تحديث نقاط المستخدم بأمان مع معاملات متقدمة"""
         try:
-            async with aiosqlite.connect(self.db_name, timeout=30) as conn:
-                conn.row_factory = aiosqlite.Row
+            conn = await self.get_connection()
+            async with conn:
                 await conn.execute("BEGIN TRANSACTION")
                 
                 # التحقق من وجود المستخدم
@@ -734,7 +834,7 @@ class AsyncDatabaseManager:
         """حظر مستخدم مع تسجيل السبب"""
         try:
             await self.execute_update(
-                "UPDATE users SET is_banned = 1 WHERE user_id = ?",
+                "UPDATE users SET is_banned = 1, is_active = 0 WHERE user_id = ?",
                 (user_id,)
             )
             
@@ -755,7 +855,7 @@ class AsyncDatabaseManager:
         """فك حظر مستخدم"""
         try:
             await self.execute_update(
-                "UPDATE users SET is_banned = 0 WHERE user_id = ?",
+                "UPDATE users SET is_banned = 0, is_active = 1 WHERE user_id = ?",
                 (user_id,)
             )
             
@@ -797,42 +897,94 @@ class AsyncDatabaseManager:
             logger.error(f"خطأ في الحصول على سجل المستخدم {user_id}: {e}")
             return []
     
-    # --- نظام التحقق من القنوات المتقدم ---
+    # --- نظام التحقق من القنوات المتقدم مع التخزين المؤقت ---
     
-    async def check_channel_subscription(self, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """التحقق من اشتراك المستخدم في القنوات الإجبارية"""
+    async def check_channel_subscription(self, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple:
+        """التحقق من اشتراك المستخدم في القنوات الإجبارية مع التخزين المؤقت"""
+        cache_key = f"channel_check_{user_id}"
+        cached_result = self.get_cached_data(cache_key)
+        if cached_result:
+            return cached_result
+        
         try:
             # التحقق من تفعيل النظام
             force_subscription = await self.get_setting("force_channel_subscription")
-            if force_subscription != "1":
-                return True
+            if not force_subscription or force_subscription != "1":
+                result = (True, "")
+                self.set_cached_data(cache_key, result)
+                return result
             
             channels = await self.get_channels(active_only=True)
             if not channels:
-                return True
+                result = (True, "")
+                self.set_cached_data(cache_key, result)
+                return result
             
+            unsubscribed_channels = []
             for channel in channels:
                 channel_id = channel['channel_id']
                 try:
-                    # محاولة الحصول على حالة العضوية
+                    # التحقق من وجود البوت كأدمن في القناة
+                    bot_is_admin = channel.get('bot_is_admin', 0)
+                    if bot_is_admin == 0:
+                        try:
+                            bot_member = await context.bot.get_chat_member(channel_id, context.bot.id)
+                            if bot_member.status in ['administrator', 'creator']:
+                                await self.execute_update(
+                                    "UPDATE forced_channels SET bot_is_admin = 1 WHERE channel_id = ?",
+                                    (channel_id,)
+                                )
+                                bot_is_admin = 1
+                            else:
+                                await self.execute_update(
+                                    "UPDATE forced_channels SET bot_is_admin = 0 WHERE channel_id = ?",
+                                    (channel_id,)
+                                )
+                        except Exception as e:
+                            logger.error(f"البوت ليس أدمن في القناة {channel_id}: {e}")
+                            continue
+                    
+                    # التحقق من عضوية المستخدم
                     chat_member = await context.bot.get_chat_member(channel_id, user_id)
                     if chat_member.status in ['left', 'kicked']:
-                        return False
+                        channel_link = channel['channel_link']
+                        channel_name = channel['channel_name'] or "القناة"
+                        unsubscribed_channels.append(f"• {channel_name}: {channel_link}")
+                except Forbidden:
+                    # المستخدم حظر البوت أو البوت ليس أدمن
+                    logger.warning(f"لا يمكن الوصول للقناة {channel_id} - قد يكون البوت محظوراً")
+                    continue
+                except BadRequest as e:
+                    logger.error(f"طلب غير صالح للقناة {channel_id}: {e}")
+                    continue
                 except Exception as e:
                     logger.error(f"خطأ في التحقق من عضوية القناة {channel_id}: {e}")
-                    # في حالة الخطأ، نعتبر أن المستخدم لم يشترك
-                    return False
+                    continue
             
-            # تحديث وقت آخر تحقق
-            await self.execute_update(
-                "UPDATE users SET last_channel_check = ? WHERE user_id = ?",
-                (datetime.now().isoformat(), user_id)
-            )
+            if unsubscribed_channels:
+                message = (
+                    "⚠️ <b>يجب الاشتراك في القنوات التالية أولاً:</b>\n\n"
+                    + "\n".join(unsubscribed_channels) +
+                    "\n\n✅ بعد الاشتراك، أرسل /start"
+                )
+                result = (False, message)
+            else:
+                result = (True, "")
+                
+                # تحديث وقت آخر تحقق
+                await self.execute_update(
+                    "UPDATE users SET last_channel_check = ? WHERE user_id = ?",
+                    (datetime.now().isoformat(), user_id)
+                )
             
-            return True
+            # تخزين النتيجة مؤقتاً لمدة دقيقتين
+            self.set_cached_data(cache_key, result)
+            return result
+            
         except Exception as e:
             logger.error(f"خطأ في التحقق من اشتراك القنوات للمستخدم {user_id}: {e}")
-            return False
+            # في حالة الخطأ، نسمح للمستخدم بالمتابعة لمنع حجب الخدمة
+            return (True, "")
     
     async def add_channel(self, channel_id: str, channel_link: str, added_by: int, channel_name: str = "") -> bool:
         """إضافة قناة جديدة مع معلومات إضافية"""
@@ -900,7 +1052,7 @@ class AsyncDatabaseManager:
     async def get_channels(self, active_only: bool = False):
         """الحصول على جميع القنوات"""
         try:
-            query = "SELECT channel_id, channel_link, is_active, channel_name FROM forced_channels"
+            query = "SELECT channel_id, channel_link, is_active, channel_name, bot_is_admin FROM forced_channels"
             if active_only:
                 query += " WHERE is_active = 1"
             query += " ORDER BY added_at DESC"
@@ -1043,8 +1195,8 @@ class AsyncDatabaseManager:
     async def redeem_promo_code(self, user_id: int, code: str) -> Union[int, str]:
         """استبدال كود مع معالجة أخطاء متقدمة"""
         try:
-            async with aiosqlite.connect(self.db_name, timeout=30) as conn:
-                conn.row_factory = aiosqlite.Row
+            conn = await self.get_connection()
+            async with conn:
                 await conn.execute("BEGIN TRANSACTION")
                 
                 # التحقق من وجود الكود
@@ -1075,7 +1227,7 @@ class AsyncDatabaseManager:
                     await conn.execute("ROLLBACK")
                     return "expired"
                 
-                # التحقق من تاريخ الانتهاء (بمعالجة قيمة None)
+                # التحقق من تاريخ الانتهاء
                 if expires_at:
                     try:
                         expires_date = datetime.fromisoformat(expires_at)
@@ -1184,7 +1336,7 @@ class AsyncDatabaseManager:
         """الحصول على إحصائيات عامة متقدمة"""
         try:
             # عدد المستخدمين النشطين
-            users_result = await self.execute_query_one("SELECT COUNT(*) as count FROM users WHERE is_banned = 0")
+            users_result = await self.execute_query_one("SELECT COUNT(*) as count FROM users WHERE is_banned = 0 AND is_active = 1")
             users_count = users_result['count'] if users_result else 0
             
             # مجموع النقاط
@@ -1227,7 +1379,7 @@ class AsyncDatabaseManager:
         try:
             cutoff = (datetime.now() - timedelta(days=days)).isoformat()
             result = await self.execute_query_one(
-                "SELECT COUNT(*) as count FROM users WHERE joined_date > ? AND is_banned = 0",
+                "SELECT COUNT(*) as count FROM users WHERE joined_date > ? AND is_banned = 0 AND is_active = 1",
                 (cutoff,)
             )
             return result['count'] if result else 0
@@ -1241,7 +1393,7 @@ class AsyncDatabaseManager:
             result = await self.execute_query(
                 """SELECT user_id, username, full_name, points 
                 FROM users 
-                WHERE is_banned = 0 
+                WHERE is_banned = 0 AND is_active = 1
                 ORDER BY points DESC 
                 LIMIT ?""",
                 (limit,)
@@ -1258,7 +1410,7 @@ class AsyncDatabaseManager:
                 """SELECT u.user_id, u.username, u.full_name, COUNT(r.referred_id) as referral_count
                 FROM users u
                 LEFT JOIN referrals r ON u.user_id = r.referrer_id
-                WHERE u.is_banned = 0
+                WHERE u.is_banned = 0 AND u.is_active = 1
                 GROUP BY u.user_id
                 ORDER BY referral_count DESC
                 LIMIT ?""",
@@ -1272,9 +1424,9 @@ class AsyncDatabaseManager:
     async def get_all_users(self, exclude_banned: bool = True, limit: int = None, offset: int = 0):
         """الحصول على جميع المستخدمين مع ترقيم الصفحات"""
         try:
-            query = "SELECT user_id, username, full_name, points, is_banned FROM users"
+            query = "SELECT user_id, username, full_name, points, is_banned, is_active FROM users"
             if exclude_banned:
-                query += " WHERE is_banned = 0"
+                query += " WHERE is_banned = 0 AND is_active = 1"
             query += " ORDER BY user_id"
             
             if limit:
@@ -1418,37 +1570,51 @@ class AsyncDatabaseManager:
         try:
             # الحصول على عدد أيام الاحتفاظ من الإعدادات
             auto_cleanup_days = await self.get_setting("auto_cleanup_days", 90)
+            inactive_user_days = await self.get_setting("inactive_user_days", 30)
             cutoff_date = (datetime.now() - timedelta(days=auto_cleanup_days)).strftime("%Y-%m-%d")
+            inactive_cutoff = (datetime.now() - timedelta(days=inactive_user_days)).strftime("%Y-%m-%d")
             
             # حذف الأكواد المنتهية
-            await self.execute_update(
+            deleted_codes = await self.execute_update(
                 "DELETE FROM promo_codes WHERE expires_at < ? AND expires_at IS NOT NULL",
                 (cutoff_date,)
             )
+            logger.info(f"🧹 تم حذف {deleted_codes} كود منتهي الصلاحية")
             
             # حذف سجلات الدفع القديمة
-            await self.execute_update(
+            deleted_payments = await self.execute_update(
                 "DELETE FROM star_payments WHERE timestamp < ?",
                 (cutoff_date,)
             )
+            logger.info(f"🧹 تم حذف {deleted_payments} سجل دفع قديم")
             
             # حذف السجلات القديمة (ولكن الاحتفاظ بالمستخدمين)
-            await self.execute_update(
+            deleted_transactions = await self.execute_update(
                 "DELETE FROM transactions WHERE timestamp < ? AND type IN ('🎯 رشق', '🎁 مكافأة', '🎫 كود')",
                 (cutoff_date,)
             )
+            logger.info(f"🧹 تم حذف {deleted_transactions} سجل معاملة قديم")
+            
+            # تعطيل المستخدمين غير النشطين
+            deactivated_users = await self.execute_update(
+                "UPDATE users SET is_active = 0 WHERE last_active < ? AND is_banned = 0 AND is_active = 1",
+                (inactive_cutoff,)
+            )
+            logger.info(f"🧹 تم تعطيل {deactivated_users} مستخدم غير نشط")
             
             # حذف الإشعارات القديمة
-            await self.execute_update(
+            deleted_notifications = await self.execute_update(
                 "DELETE FROM notifications WHERE created_at < ? AND is_read = 1",
                 (cutoff_date,)
             )
+            logger.info(f"🧹 تم حذف {deleted_notifications} إشعار قديم")
             
             # حذف أنشطة البوت القديمة
-            await self.execute_update(
+            deleted_activities = await self.execute_update(
                 "DELETE FROM bot_activities WHERE timestamp < ?",
                 (cutoff_date,)
             )
+            logger.info(f"🧹 تم حذف {deleted_activities} سجل نشاط قديم")
             
             # تحسين قاعدة البيانات
             await self.execute_update("VACUUM")
@@ -1463,7 +1629,7 @@ class AsyncDatabaseManager:
 db = AsyncDatabaseManager()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🛠️ أدوات مساعدة متقدمة
+# 🛠️ أدوات مساعدة متقدمة مع Rate Limiting
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def get_user_link(user_id: int, name: str) -> str:
@@ -1515,44 +1681,47 @@ def get_support_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(btns)
 
 async def check_maintenance_mode(user_id: int) -> bool:
-    """التحقق من وضع الصيانة"""
+    """التحقق من وضع الصيانة مع التخزين المؤقت"""
     if user_id == ADMIN_ID:
         return False
+    
+    cache_key = "maintenance_mode"
+    cached = db.get_cached_data(cache_key)
+    if cached is not None:
+        return cached
+    
     maintenance_mode = await db.get_setting("maintenance_mode")
-    return bool(maintenance_mode)
+    result = bool(maintenance_mode)
+    db.set_cached_data(cache_key, result)
+    return result
+
+async def check_rate_limit(user_id: int) -> tuple:
+    """التحقق من Rate Limiting مع التخزين المؤقت"""
+    return await db.check_rate_limit(user_id)
+
+async def safe_api_call(func, *args, **kwargs):
+    """تنفيذ استدعاء API بأمان مع معالجة الأخطاء"""
+    try:
+        return await func(*args, **kwargs)
+    except Forbidden as e:
+        logger.warning(f"المستخدم حظر البوت أو ليس لديه إذن: {e}")
+        return None
+    except BadRequest as e:
+        logger.error(f"طلب غير صالح: {e}")
+        return None
+    except TimedOut as e:
+        logger.error(f"انتهت مهلة الطلب: {e}")
+        return None
+    except NetworkError as e:
+        logger.error(f"خطأ في الشبكة: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"خطأ غير متوقع في API: {e}")
+        return None
 
 async def check_channel_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple:
     """التحقق من اشتراك المستخدم في القنوات المطلوبة"""
-    # التحقق من تفعيل النظام
-    force_subscription = await db.get_setting("force_channel_subscription")
-    if not force_subscription:
-        return True, ""
-    
-    channels = await db.get_channels(active_only=True)
-    if not channels:
-        return True, ""
-    
-    unsubscribed_channels = []
-    for channel in channels:
-        channel_id = channel['channel_id']
-        try:
-            chat_member = await context.bot.get_chat_member(channel_id, user_id)
-            if chat_member.status in ['left', 'kicked']:
-                channel_link = channel['channel_link']
-                channel_name = channel['channel_name'] or "القناة"
-                unsubscribed_channels.append(f"• {channel_name}: {channel_link}")
-        except Exception as e:
-            logger.error(f"خطأ في التحقق من عضوية القناة {channel_id}: {e}")
-    
-    if unsubscribed_channels:
-        message = (
-            "⚠️ <b>يجب الاشتراك في القنوات التالية أولاً:</b>\n\n"
-            + "\n".join(unsubscribed_channels) +
-            "\n\n✅ بعد الاشتراك، أرسل /start"
-        )
-        return False, message
-    
-    return True, ""
+    return await db.check_channel_subscription(user_id, context)
 
 def is_admin(user_id: int) -> bool:
     """التحقق إذا كان المستخدم أدمن"""
@@ -1575,7 +1744,7 @@ def format_datetime(dt_string: str) -> str:
 async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
     """حذف رسالة بأمان"""
     try:
-        await context.bot.delete_message(chat_id, message_id)
+        await safe_api_call(context.bot.delete_message, chat_id, message_id)
     except Exception as e:
         logger.error(f"خطأ في حذف الرسالة: {e}")
 
@@ -1603,7 +1772,7 @@ def clean_context_data(context: ContextTypes.DEFAULT_TYPE, keys: list = None):
         logger.error(f"خطأ في تنظيف context: {e}")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🚀 نظام المحادثات المحسن مع Timeout
+# 🚀 نظام المحادثات المحسن مع Timeout وRate Limiting
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class ConversationManager:
@@ -1659,7 +1828,8 @@ class ConversationManager:
             try:
                 await self.end_conversation(user_id)
                 # إرسال رسالة للمستخدم
-                await application.bot.send_message(
+                await safe_api_call(
+                    application.bot.send_message,
                     user_id,
                     "⏰ <b>تم إغلاق المحادثة تلقائياً بسبب عدم النشاط.</b>\n\n"
                     "يمكنك البدء مرة أخرى باستخدام الأمر /start",
@@ -1689,6 +1859,12 @@ conv_manager = ConversationManager()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج أمر /start مع تحسينات متقدمة"""
     user = update.effective_user
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}\n\nيرجى المحاولة بعد قليل.")
+        return
     
     # إنهاء أي محادثة نشطة
     await conv_manager.end_conversation(user.id)
@@ -1747,13 +1923,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if referrer_id:
                 try:
                     referral_points = await db.get_setting("referral_points", 10)
-                    msg = (
-                        f"🔔 <b>إحالة جديدة!</b>\n\n"
-                        f"👤 المستخدم: {get_user_link(user.id, user.full_name)}\n"
-                        f"🎯 النقاط: {referral_points}\n"
-                        f"💰 رصيدك الحالي: {(await db.get_user(referrer_id))['points']:,}"
-                    )
-                    await context.bot.send_message(referrer_id, msg, parse_mode="HTML")
+                    referrer = await db.get_user(referrer_id)
+                    if referrer:
+                        msg = (
+                            f"🔔 <b>إحالة جديدة!</b>\n\n"
+                            f"👤 المستخدم: {get_user_link(user.id, user.full_name)}\n"
+                            f"🎯 النقاط: {referral_points}\n"
+                            f"💰 رصيدك الحالي: {referrer['points']:,}"
+                        )
+                        await safe_api_call(context.bot.send_message, referrer_id, msg, parse_mode="HTML")
                 except Exception as e:
                     logger.error(f"خطأ في إرسال إشعار الإحالة: {e}")
     
@@ -1762,6 +1940,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
     """إرسال لوحة التحكم مع معلومات متقدمة"""
     user = update.effective_user
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(user.id)
+    if not allowed:
+        if update.callback_query:
+            await update.callback_query.answer(message, show_alert=True)
+        return
     
     # إنهاء أي محادثة نشطة
     await conv_manager.end_conversation(user.id)
@@ -1842,6 +2027,13 @@ async def send_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
 async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """العودة للقائمة الرئيسية"""
     query = update.callback_query
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
     await query.answer()
     await conv_manager.end_conversation(query.from_user.id)
     await send_dashboard(update, context, edit=True)
@@ -1854,6 +2046,12 @@ async def buy_points_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """قائمة شراء النقاط"""
     query = update.callback_query
     user_id = query.from_user.id
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(user_id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
     
     if await check_maintenance_mode(user_id):
         await query.answer("البوت قيد الصيانة حالياً", show_alert=True)
@@ -1895,6 +2093,12 @@ async def buy_stars_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(user_id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
     if await check_maintenance_mode(user_id):
         await query.answer("البوت قيد الصيانة حالياً", show_alert=True)
         return
@@ -1929,7 +2133,8 @@ async def buy_stars_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         payload = f"stars_{package['stars']}_{package['points']}_{user_id}_{int(time.time())}"
         
-        await context.bot.send_invoice(
+        await safe_api_call(
+            context.bot.send_invoice,
             chat_id=user_id,
             title=package['title'],
             description=f"شراء {package['points']} نقطة مقابل {package['stars']} نجوم",
@@ -2049,7 +2254,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
                 f"📊 الرصيد الجديد: {format_number(new_balance)} نقطة\n"
                 f"🔗 معرِّف الدفع: {payment.provider_payment_id}"
             )
-            await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML")
+            await safe_api_call(context.bot.send_message, ADMIN_ID, admin_msg, parse_mode="HTML")
         except Exception as e:
             logger.error(f"خطأ في إرسال إشعار الأدمن: {e}")
         
@@ -2091,6 +2296,12 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not is_admin(query.from_user.id):
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
         return
     
     await query.answer()
@@ -2152,6 +2363,12 @@ async def admin_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
         return
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
     await query.answer()
     
     channels = await db.get_channels()
@@ -2160,11 +2377,12 @@ async def admin_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     if channels:
         for i, channel in enumerate(channels, 1):
             status = "🟢 مفعل" if channel['is_active'] else "🔴 معطل"
+            bot_status = "✅ أدمن" if channel['bot_is_admin'] == 1 else "❌ ليس أدمن"
             name = channel['channel_name'] or "بدون اسم"
             text += f"{i}. {name}\n"
             text += f"   🔗 {channel['channel_link']}\n"
             text += f"   🆔 <code>{channel['channel_id']}</code>\n"
-            text += f"   📊 {status}\n\n"
+            text += f"   📊 {status} | {bot_status}\n\n"
     else:
         text += "لا توجد قنوات مضافة.\n"
     
@@ -2192,6 +2410,12 @@ async def admin_add_channel_start(update: Update, context: ContextTypes.DEFAULT_
     
     if not is_admin(query.from_user.id):
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
         return
     
     await query.answer()
@@ -2228,13 +2452,21 @@ async def admin_get_channel_id(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # التحقق من وجود القناة
     try:
-        chat = await context.bot.get_chat(channel_id)
+        chat = await safe_api_call(context.bot.get_chat, channel_id)
+        if not chat:
+            await update.message.reply_text(
+                "❌ لا يمكن الوصول للقناة!\n"
+                "تحقق من الآيدي وتأكد أن البوت عضو في القناة.\n\n"
+                "أعد إرسال الآيدي أو /cancel للإلغاء:"
+            )
+            return STATE_CHANNEL_ID
+            
         channel_name = chat.title
         
-        # الحصول على معلومات البوت في القناة
+        # التحقق من وجود البوت كأدمن في القناة
         try:
-            bot_member = await context.bot.get_chat_member(channel_id, context.bot.id)
-            if bot_member.status not in ['administrator', 'creator']:
+            bot_member = await safe_api_call(context.bot.get_chat_member, channel_id, context.bot.id)
+            if not bot_member or bot_member.status not in ['administrator', 'creator']:
                 await update.message.reply_text(
                     "❌ البوت ليس أدمن في هذه القناة!\n"
                     "يجب رفع البوت كأدمن أولاً.\n\n"
@@ -2243,7 +2475,7 @@ async def admin_get_channel_id(update: Update, context: ContextTypes.DEFAULT_TYP
                 return STATE_CHANNEL_ID
         except Exception as e:
             await update.message.reply_text(
-                f"❌ لا يمكن الوصول للقناة: {str(e)[:100]}\n\n"
+                f"❌ لا يمكن التحقق من صلاحية البوت: {str(e)[:100]}\n\n"
                 "أعد إرسال آيدي قناة أخرى أو /cancel للإلغاء:"
             )
             return STATE_CHANNEL_ID
@@ -2310,6 +2542,13 @@ async def admin_get_channel_link(update: Update, context: ContextTypes.DEFAULT_T
     await admin_panel(update, context)
     return ConversationHandler.END
 
+async def admin_cancel_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء إضافة قناة"""
+    await conv_manager.end_conversation(update.effective_user.id)
+    await update.message.reply_text("❌ تم إلغاء عملية إضافة القناة.")
+    await admin_channels_menu(update, context)
+    return ConversationHandler.END
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 👤 إدارة المستخدمين المحسنة مع بحث متقدم
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2320,6 +2559,12 @@ async def admin_users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not is_admin(query.from_user.id):
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
         return
     
     await query.answer()
@@ -2358,6 +2603,12 @@ async def admin_search_by_id_start(update: Update, context: ContextTypes.DEFAULT
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
         return
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
     await query.answer()
     
     await conv_manager.start_conversation(query.from_user.id, STATE_USER_SEARCH, {'search_type': 'id'})
@@ -2369,10 +2620,66 @@ async def admin_search_by_id_start(update: Update, context: ContextTypes.DEFAULT
         parse_mode="HTML"
     )
 
+async def admin_search_by_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء البحث بالاسم"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    await conv_manager.start_conversation(query.from_user.id, STATE_USER_SEARCH, {'search_type': 'name'})
+    
+    await query.edit_message_text(
+        "🔍 <b>البحث عن مستخدم بالاسم</b>\n\n"
+        "أرسل الآن <b>اسم المستخدم</b> (كامل أو جزء منه):\n\n"
+        "❌ للإلغاء، أرسل /cancel",
+        parse_mode="HTML"
+    )
+
+async def admin_search_by_username_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء البحث باليوزر"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    await conv_manager.start_conversation(query.from_user.id, STATE_USER_SEARCH, {'search_type': 'username'})
+    
+    await query.edit_message_text(
+        "🔍 <b>البحث عن مستخدم باليوزر</b>\n\n"
+        "أرسل الآن <b>يوزر المستخدم</b> (بدون @):\n\n"
+        "❌ للإلغاء، أرسل /cancel",
+        parse_mode="HTML"
+    )
+
 async def admin_search_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """البحث عن مستخدم باستخدام طرق متعددة"""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_USER_SEARCH
     
     search_input = update.message.text.strip()
     conv_data = await conv_manager.get_conversation_data(update.effective_user.id)
@@ -2437,6 +2744,7 @@ async def show_user_management_panel(update: Update, context: ContextTypes.DEFAU
     total_spent = user_data['total_spent']
     joined_date = format_datetime(user_data['joined_date'])
     last_active = format_datetime(user_data['last_active'])
+    is_active = user_data.get('is_active', 1)
     
     # الحصول على عدد الإحالات
     referrals_result = await db.execute_query_one(
@@ -2453,7 +2761,8 @@ async def show_user_management_panel(update: Update, context: ContextTypes.DEFAU
         f"• 📛 اليوزر: @{username}\n"
         f"• 🎯 النقاط: {format_number(points)}\n"
         f"• ⚠️ التحذيرات: {warnings}\n"
-        f"• 🚫 الحالة: {'محظور' if is_banned else 'نشط'}\n\n"
+        f"• 🚫 الحالة: {'محظور' if is_banned else 'نشط'}\n"
+        f"• 📱 النشاط: {'نشط' if is_active == 1 else 'غير نشط'}\n\n"
         f"📊 <b>إحصائيات:</b>\n"
         f"• 💰 إجمالي المكتسب: {format_number(total_earned)}\n"
         f"• 💸 إجمالي المنفق: {format_number(total_spent)}\n"
@@ -2475,6 +2784,11 @@ async def show_user_management_panel(update: Update, context: ContextTypes.DEFAU
             InlineKeyboardButton("⚠️ إضافة تحذير", callback_data="admin_add_warning"),
             InlineKeyboardButton("🚫 حظر مستخدم", callback_data="admin_ban_user")
         ])
+        
+        if is_active == 0:
+            kb_buttons.append([
+                InlineKeyboardButton("✅ تفعيل الحساب", callback_data="admin_activate_user")
+            ])
     else:
         kb_buttons.append([
             InlineKeyboardButton("✅ فك الحظر", callback_data="admin_unban_user")
@@ -2499,6 +2813,254 @@ async def show_user_management_panel(update: Update, context: ContextTypes.DEFAU
     else:
         await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
 
+async def admin_add_points_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء إضافة نقاط للمستخدم"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    conv_data = await conv_manager.get_conversation_data(query.from_user.id)
+    user_id = conv_data.get('managed_user_id')
+    user_name = conv_data.get('managed_user_name', 'مستخدم')
+    
+    await conv_manager.update_conversation(
+        query.from_user.id,
+        STATE_ADD_POINTS,
+        {'action': 'add_points', 'target_user_id': user_id}
+    )
+    
+    await query.edit_message_text(
+        f"➕ <b>إضافة نقاط للمستخدم</b>\n\n"
+        f"👤 المستخدم: {user_name}\n"
+        f"🆔 الآيدي: <code>{user_id}</code>\n\n"
+        f"أرسل <b>عدد النقاط</b> التي تريد إضافتها:\n\n"
+        f"📌 <b>ملاحظة:</b> أدخل أرقاماً فقط\n"
+        f"❌ للإلغاء، أرسل /cancel",
+        parse_mode="HTML"
+    )
+    return STATE_ADD_POINTS
+
+async def admin_deduct_points_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء خصم نقاط من المستخدم"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    conv_data = await conv_manager.get_conversation_data(query.from_user.id)
+    user_id = conv_data.get('managed_user_id')
+    user_name = conv_data.get('managed_user_name', 'مستخدم')
+    
+    await conv_manager.update_conversation(
+        query.from_user.id,
+        STATE_DEDUCT_POINTS,
+        {'action': 'deduct_points', 'target_user_id': user_id}
+    )
+    
+    await query.edit_message_text(
+        f"➖ <b>خصم نقاط من المستخدم</b>\n\n"
+        f"👤 المستخدم: {user_name}\n"
+        f"🆔 الآيدي: <code>{user_id}</code>\n\n"
+        f"أرسل <b>عدد النقاط</b> التي تريد خصمها:\n\n"
+        f"📌 <b>ملاحظة:</b> أدخل أرقاماً فقط\n"
+        f"❌ للإلغاء، أرسل /cancel",
+        parse_mode="HTML"
+    )
+    return STATE_DEDUCT_POINTS
+
+async def admin_process_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة إضافة/خصم النقاط"""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        current_state = await conv_manager.get_conversation_state(update.effective_user.id)
+        return current_state
+    
+    try:
+        points = int(update.message.text.strip())
+        
+        if points <= 0:
+            await update.message.reply_text("❌ عدد النقاط يجب أن يكون أكبر من صفر!\nأعد إرسال العدد:")
+            current_state = await conv_manager.get_conversation_state(update.effective_user.id)
+            return current_state
+        
+        conv_data = await conv_manager.get_conversation_data(update.effective_user.id)
+        action = conv_data.get('action')
+        user_id = conv_data.get('target_user_id')
+        user_name = conv_data.get('managed_user_name', 'مستخدم')
+        
+        if action == 'add_points':
+            # إضافة النقاط
+            await db.update_points(user_id, points, "admin_add", f"إضافة بواسطة الأدمن: {update.effective_user.full_name}")
+            
+            # إرسال إشعار للمستخدم
+            try:
+                user_msg = f"✅ <b>تمت إضافة {points} نقطة لحسابك!</b>\n\n👤 الإداري: {update.effective_user.full_name}"
+                await safe_api_call(context.bot.send_message, user_id, user_msg, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"خطأ في إرسال إشعار للمستخدم: {e}")
+            
+            result_text = f"✅ تمت إضافة {points} نقطة للمستخدم {user_name}"
+            
+        elif action == 'deduct_points':
+            # التحقق من رصيد المستخدم
+            user_data = await db.get_user(user_id)
+            if user_data and user_data['points'] < points:
+                await update.message.reply_text(f"❌ رصيد المستخدم غير كافي! الرصيد الحالي: {user_data['points']}\nأعد إرسال عدد أقل:")
+                current_state = await conv_manager.get_conversation_state(update.effective_user.id)
+                return current_state
+            
+            # خصم النقاط
+            await db.update_points(user_id, -points, "admin_deduct", f"خصم بواسطة الأدمن: {update.effective_user.full_name}")
+            
+            # إرسال إشعار للمستخدم
+            try:
+                user_msg = f"⚠️ <b>تم خصم {points} نقطة من حسابك!</b>\n\n👤 الإداري: {update.effective_user.full_name}"
+                await safe_api_call(context.bot.send_message, user_id, user_msg, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"خطأ في إرسال إشعار للمستخدم: {e}")
+            
+            result_text = f"✅ تم خصم {points} نقطة من المستخدم {user_name}"
+        
+        else:
+            await update.message.reply_text("❌ إجراء غير معروف!")
+            await conv_manager.end_conversation(update.effective_user.id)
+            return ConversationHandler.END
+        
+        # العودة إلى لوحة إدارة المستخدم
+        conv_data = await conv_manager.get_conversation_data(update.effective_user.id)
+        user_data = conv_data.get('managed_user_data')
+        
+        if user_data:
+            await update.message.reply_text(result_text)
+            await show_user_management_panel(update, context, user_data)
+            await conv_manager.end_conversation(update.effective_user.id)
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text("❌ حدث خطأ في استعادة بيانات المستخدم!")
+            await conv_manager.end_conversation(update.effective_user.id)
+            await admin_users_menu(update, context)
+            return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ يجب إدخال أرقام فقط!\nأعد إرسال العدد:")
+        current_state = await conv_manager.get_conversation_state(update.effective_user.id)
+        return current_state
+
+async def admin_ban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حظر مستخدم"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    conv_data = await conv_manager.get_conversation_data(query.from_user.id)
+    user_id = conv_data.get('managed_user_id')
+    user_name = conv_data.get('managed_user_name', 'مستخدم')
+    
+    await db.ban_user(user_id, "حظر يدوي", query.from_user.id)
+    
+    # إرسال إشعار للمستخدم
+    try:
+        user_msg = "🚫 <b>تم حظر حسابك!</b>\n\nللمزيد من المعلومات، تواصل مع الدعم."
+        await safe_api_call(context.bot.send_message, user_id, user_msg, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"خطأ في إرسال إشعار الحظر: {e}")
+    
+    await query.edit_message_text(
+        f"✅ <b>تم حظر المستخدم بنجاح!</b>\n\n"
+        f"👤 المستخدم: {user_name}\n"
+        f"🆔 الآيدي: <code>{user_id}</code>\n"
+        f"👤 المحظِر: {query.from_user.full_name}",
+        parse_mode="HTML"
+    )
+    
+    # تحديث بيانات المستخدم
+    user_data = await db.get_user(user_id)
+    if user_data:
+        await show_user_management_panel(update, context, user_data)
+
+async def admin_unban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فك حظر مستخدم"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    conv_data = await conv_manager.get_conversation_data(query.from_user.id)
+    user_id = conv_data.get('managed_user_id')
+    user_name = conv_data.get('managed_user_name', 'مستخدم')
+    
+    await db.unban_user(user_id, query.from_user.id)
+    
+    # إرسال إشعار للمستخدم
+    try:
+        user_msg = "✅ <b>تم فك حظر حسابك!</b>\n\nيمكنك الآن استخدام البوت مرة أخرى."
+        await safe_api_call(context.bot.send_message, user_id, user_msg, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"خطأ في إرسال إشعار فك الحظر: {e}")
+    
+    await query.edit_message_text(
+        f"✅ <b>تم فك حظر المستخدم بنجاح!</b>\n\n"
+        f"👤 المستخدم: {user_name}\n"
+        f"🆔 الآيدي: <code>{user_id}</code>\n"
+        f"👤 المفعِل: {query.from_user.full_name}",
+        parse_mode="HTML"
+    )
+    
+    # تحديث بيانات المستخدم
+    user_data = await db.get_user(user_id)
+    if user_data:
+        await show_user_management_panel(update, context, user_data)
+
+async def admin_cancel_user_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء إدارة المستخدم"""
+    await conv_manager.end_conversation(update.effective_user.id)
+    await update.message.reply_text("❌ تم إلغاء العملية.")
+    await admin_users_menu(update, context)
+    return ConversationHandler.END
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 📤 نظام الإذاعة المتطور المحسن مع إدارة Flood
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2509,6 +3071,12 @@ async def admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if not is_admin(query.from_user.id):
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
         return
     
     await query.answer()
@@ -2563,6 +3131,12 @@ async def admin_start_broadcast(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
         return
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
     await query.answer()
     
     media_type = query.data.replace("broadcast_", "")
@@ -2607,9 +3181,15 @@ async def admin_get_broadcast_message(update: Update, context: ContextTypes.DEFA
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     
-    message = update.message.text
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_BROADCAST_MESSAGE
     
-    if len(message) > 1000:
+    message_text = update.message.text
+    
+    if len(message_text) > 1000:
         await update.message.reply_text(
             "❌ النص طويل جداً! الحد الأقصى 1000 حرف.\n"
             "أعد إرسال نص أقصر:"
@@ -2619,7 +3199,7 @@ async def admin_get_broadcast_message(update: Update, context: ContextTypes.DEFA
     await conv_manager.update_conversation(
         update.effective_user.id,
         STATE_BROADCAST_MESSAGE,
-        {'broadcast_message': message}
+        {'broadcast_message': message_text}
     )
     
     conv_data = await conv_manager.get_conversation_data(update.effective_user.id)
@@ -2627,7 +3207,7 @@ async def admin_get_broadcast_message(update: Update, context: ContextTypes.DEFA
     
     if media_type == 'text':
         # الانتقال مباشرة للخيارات
-        await show_broadcast_options(update, context, message, media_type)
+        await show_broadcast_options(update, context, message_text, media_type)
         await conv_manager.end_conversation(update.effective_user.id)
         return ConversationHandler.END
     else:
@@ -2638,7 +3218,7 @@ async def admin_get_broadcast_message(update: Update, context: ContextTypes.DEFA
         }
         
         await update.message.reply_text(
-            f"✅ تم حفظ النص ({len(message)} حرف).\n\n"
+            f"✅ تم حفظ النص ({len(message_text)} حرف).\n\n"
             f"📁 <b>الخطوة 2/2:</b> أرسل ال{media_names[media_type]}\n\n"
             f"❌ للإلغاء، أرسل /cancel"
         )
@@ -2649,9 +3229,15 @@ async def admin_get_broadcast_media(update: Update, context: ContextTypes.DEFAUL
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_BROADCAST_MEDIA
+    
     conv_data = await conv_manager.get_conversation_data(update.effective_user.id)
     media_type = conv_data.get('broadcast_media')
-    message = conv_data.get('broadcast_message', '')
+    message_text = conv_data.get('broadcast_message', '')
     
     file_id = None
     
@@ -2673,7 +3259,7 @@ async def admin_get_broadcast_media(update: Update, context: ContextTypes.DEFAUL
         )
         
         # عرض خيارات الإرسال
-        await show_broadcast_options(update, context, message, media_type, file_id)
+        await show_broadcast_options(update, context, message_text, media_type, file_id)
         await conv_manager.end_conversation(update.effective_user.id)
         return ConversationHandler.END
         
@@ -2743,6 +3329,12 @@ async def admin_send_broadcast_execute(update: Update, context: ContextTypes.DEF
     
     if not is_admin(query.from_user.id):
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
         return
     
     await query.answer()
@@ -2815,78 +3407,85 @@ async def admin_send_broadcast_execute(update: Update, context: ContextTypes.DEF
             
             try:
                 if media_type == "text":
-                    msg = await context.bot.send_message(
+                    msg = await safe_api_call(
+                        context.bot.send_message,
                         chat_id=user_id,
                         text=message,
                         parse_mode="HTML",
                         disable_web_page_preview=True
                     )
-                    if pin_message:
+                    if pin_message and msg:
                         try:
-                            await context.bot.pin_chat_message(user_id, msg.message_id, disable_notification=True)
+                            await safe_api_call(context.bot.pin_chat_message, user_id, msg.message_id, disable_notification=True)
                         except:
                             pass
                 
                 elif media_type == "photo":
-                    msg = await context.bot.send_photo(
+                    msg = await safe_api_call(
+                        context.bot.send_photo,
                         chat_id=user_id,
                         photo=file_id,
                         caption=message,
                         parse_mode="HTML"
                     )
-                    if pin_message:
+                    if pin_message and msg:
                         try:
-                            await context.bot.pin_chat_message(user_id, msg.message_id, disable_notification=True)
+                            await safe_api_call(context.bot.pin_chat_message, user_id, msg.message_id, disable_notification=True)
                         except:
                             pass
                 
                 elif media_type == "video":
-                    msg = await context.bot.send_video(
+                    msg = await safe_api_call(
+                        context.bot.send_video,
                         chat_id=user_id,
                         video=file_id,
                         caption=message,
                         parse_mode="HTML"
                     )
-                    if pin_message:
+                    if pin_message and msg:
                         try:
-                            await context.bot.pin_chat_message(user_id, msg.message_id, disable_notification=True)
+                            await safe_api_call(context.bot.pin_chat_message, user_id, msg.message_id, disable_notification=True)
                         except:
                             pass
                 
                 elif media_type == "document":
-                    msg = await context.bot.send_document(
+                    msg = await safe_api_call(
+                        context.bot.send_document,
                         chat_id=user_id,
                         document=file_id,
                         caption=message,
                         parse_mode="HTML"
                     )
-                    if pin_message:
+                    if pin_message and msg:
                         try:
-                            await context.bot.pin_chat_message(user_id, msg.message_id, disable_notification=True)
+                            await safe_api_call(context.bot.pin_chat_message, user_id, msg.message_id, disable_notification=True)
                         except:
                             pass
                 
-                sent_count += 1
-                batch_sent += 1
-                
-            except Exception as e:
-                error_msg = str(e)
-                if "Forbidden" in error_msg:
-                    error_reason = "المستخدم حظر البوت"
-                elif "blocked" in error_msg.lower():
-                    error_reason = "المستخدم حظر البوت"
-                elif "Chat not found" in error_msg:
-                    error_reason = "المستخدم لم يبدأ محادثة"
-                elif "Too Many Requests" in error_msg:
-                    error_reason = "حدود التلغرام"
-                    # استراحة في حالة Flood
-                    await asyncio.sleep(5)
+                if msg:
+                    sent_count += 1
+                    batch_sent += 1
                 else:
-                    error_reason = error_msg[:50]
+                    failed_count += 1
+                    batch_failed += 1
+                    failed_users_details.append(f"{full_name} ({user_id}) - فشل في الإرسال")
                 
+            except Forbidden:
                 failed_count += 1
                 batch_failed += 1
-                failed_users_details.append(f"{full_name} ({user_id}) - {error_reason}")
+                failed_users_details.append(f"{full_name} ({user_id}) - حظر البوت")
+            except BadRequest as e:
+                failed_count += 1
+                batch_failed += 1
+                failed_users_details.append(f"{full_name} ({user_id}) - {str(e)[:50]}")
+            except TimedOut:
+                failed_count += 1
+                batch_failed += 1
+                failed_users_details.append(f"{full_name} ({user_id}) - انتهت المهلة")
+            except Exception as e:
+                failed_count += 1
+                batch_failed += 1
+                failed_users_details.append(f"{full_name} ({user_id}) - {str(e)[:50]}")
             
             # تأخير بين الإرسالات داخل الباتش
             await asyncio.sleep(broadcast_delay)
@@ -2946,6 +3545,13 @@ async def admin_send_broadcast_execute(update: Update, context: ContextTypes.DEF
     # تنظيف البيانات المؤقتة
     clean_context_data(context, ['broadcast_data'])
 
+async def admin_cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء الإذاعة"""
+    await conv_manager.end_conversation(update.effective_user.id)
+    await update.message.reply_text("❌ تم إلغاء عملية الإذاعة.")
+    await admin_broadcast_menu(update, context)
+    return ConversationHandler.END
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🎫 نظام الأكواد المحسن مع معالجة أخطاء متقدمة
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2956,6 +3562,12 @@ async def admin_codes_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not is_admin(query.from_user.id):
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
         return
     
     await query.answer()
@@ -2994,6 +3606,12 @@ async def admin_create_code_start(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
         return
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
     await query.answer()
     
     await conv_manager.start_conversation(query.from_user.id, STATE_CREATE_CODE)
@@ -3010,6 +3628,12 @@ async def admin_save_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """حفظ الكود الجديد"""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_CREATE_CODE
     
     code = update.message.text.strip().upper()
     
@@ -3049,6 +3673,12 @@ async def admin_get_code_points(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_POINTS_AMOUNT
+    
     try:
         points = int(update.message.text.strip())
         
@@ -3085,6 +3715,12 @@ async def admin_get_code_expiry(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_CODE_EXPIRY
+    
     try:
         max_uses = int(update.message.text.strip())
         
@@ -3120,6 +3756,12 @@ async def admin_finish_code_creation(update: Update, context: ContextTypes.DEFAU
     """إنهاء إنشاء الكود"""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_CONFIRM_ACTION
     
     try:
         expiry_days = int(update.message.text.strip())
@@ -3177,6 +3819,13 @@ async def admin_finish_code_creation(update: Update, context: ContextTypes.DEFAU
         )
         return STATE_CONFIRM_ACTION
 
+async def admin_cancel_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء إنشاء كود"""
+    await conv_manager.end_conversation(update.effective_user.id)
+    await update.message.reply_text("❌ تم إلغاء إنشاء الكود.")
+    await admin_codes_menu(update, context)
+    return ConversationHandler.END
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 📞 نظام الدعم الفني المحسن
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3184,6 +3833,12 @@ async def admin_finish_code_creation(update: Update, context: ContextTypes.DEFAU
 async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج الدعم الفني"""
     query = update.callback_query
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
     
     if await check_maintenance_mode(query.from_user.id):
         await query.answer("البوت قيد الصيانة حالياً", show_alert=True)
@@ -3216,6 +3871,12 @@ async def create_ticket_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     """بدء إنشاء تذكرة دعم"""
     query = update.callback_query
     
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
     if await check_maintenance_mode(query.from_user.id):
         await query.answer("البوت قيد الصيانة حالياً", show_alert=True)
         return
@@ -3241,6 +3902,12 @@ async def create_ticket_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def process_ticket_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة فئة التذكرة"""
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_SUPPORT_TICKET
+    
     user_input = update.message.text.strip()
     
     category_map = {
@@ -3290,6 +3957,12 @@ async def process_ticket_category(update: Update, context: ContextTypes.DEFAULT_
 
 async def finish_ticket_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """إنهاء إنشاء التذكرة"""
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_CONFIRM_ACTION
+    
     description = update.message.text.strip()
     
     if len(description) < 10:
@@ -3330,7 +4003,7 @@ async def finish_ticket_creation(update: Update, context: ContextTypes.DEFAULT_T
                 f"📝 الفئة: {category_names[category]}\n"
                 f"📄 الوصف: {description[:200]}..."
             )
-            await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode="HTML")
+            await safe_api_call(context.bot.send_message, ADMIN_ID, admin_notification, parse_mode="HTML")
         except Exception as e:
             logger.error(f"خطأ في إرسال إشعار الأدمن: {e}")
         
@@ -3355,6 +4028,679 @@ async def finish_ticket_creation(update: Update, context: ContextTypes.DEFAULT_T
     
     await conv_manager.end_conversation(update.effective_user.id)
     await send_dashboard(update, context)
+    return ConversationHandler.END
+
+async def cancel_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء إنشاء تذكرة"""
+    await conv_manager.end_conversation(update.effective_user.id)
+    await update.message.reply_text("❌ تم إلغاء إنشاء التذكرة.")
+    await support_handler(update, context)
+    return ConversationHandler.END
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🔧 دوال الأدمن المكتملة التي كانت فارغة
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def admin_analytics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قائمة الإحصائيات المتقدمة"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    # الحصول على إحصائيات متقدمة
+    users_count, total_points, total_tx, total_stars, last_24h_tx, total_referrals, daily_active_users = await db.get_global_stats()
+    new_users_today = await db.get_new_users_stats(1)
+    new_users_week = await db.get_new_users_stats(7)
+    new_users_month = await db.get_new_users_stats(30)
+    
+    # إحصائيات الأكواد
+    total_codes = await db.execute_query_one("SELECT COUNT(*) as count FROM promo_codes")
+    total_codes_count = total_codes['count'] if total_codes else 0
+    active_codes = await db.get_all_promo_codes(active_only=True)
+    
+    # إحصائيات القنوات
+    total_channels = await db.execute_query_one("SELECT COUNT(*) as count FROM forced_channels")
+    total_channels_count = total_channels['count'] if total_channels else 0
+    
+    # أفضل 5 مستخدمين
+    top_users = await db.get_top_rich_users(5)
+    
+    # أفضل 3 مشيرين
+    top_referrers = await db.get_top_referrers(3)
+    
+    # إيرادات مقدرة
+    revenue_estimate = total_stars * 0.01
+    
+    text = (
+        f"📈 <b>الإحصائيات المتقدمة</b>\n\n"
+        
+        f"👥 <b>المستخدمين:</b>\n"
+        f"• إجمالي المستخدمين: {format_number(users_count)}\n"
+        f"• مستخدمين اليوم: {format_number(new_users_today)}\n"
+        f"• مستخدمين الأسبوع: {format_number(new_users_week)}\n"
+        f"• مستخدمين الشهر: {format_number(new_users_month)}\n"
+        f"• النشطين اليوم: {format_number(daily_active_users)}\n\n"
+        
+        f"💰 <b>النقاط والمالية:</b>\n"
+        f"• النقاط الكلية: {format_number(total_points)}\n"
+        f"• النجوم المشتراة: {format_number(total_stars)}\n"
+        f"• الإيراد المقدر: ${revenue_estimate:.2f}\n"
+        f"• العمليات (24س): {format_number(last_24h_tx)}\n"
+        f"• الإحالات النشطة: {format_number(total_referrals)}\n\n"
+        
+        f"🎫 <b>الأكواد:</b>\n"
+        f"• الأكواد الكلية: {format_number(total_codes_count)}\n"
+        f"• الأكواد النشطة: {format_number(len(active_codes))}\n\n"
+        
+        f"📢 <b>القنوات:</b>\n"
+        f"• القنوات الكلية: {format_number(total_channels_count)}\n\n"
+    )
+    
+    if top_users:
+        text += f"🏆 <b>أفضل 5 مستخدمين:</b>\n"
+        for i, user in enumerate(top_users, 1):
+            text += f"{i}. {user['full_name']} - {format_number(user['points'])} نقطة\n"
+        text += "\n"
+    
+    if top_referrers:
+        text += f"👥 <b>أفضل 3 مشيرين:</b>\n"
+        for i, referrer in enumerate(top_referrers, 1):
+            text += f"{i}. {referrer['full_name']} - {referrer['referral_count']} إحالة\n"
+        text += "\n"
+    
+    text += "👇 اختر الإجراء المطلوب:"
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 تحديث الإحصائيات", callback_data="admin_analytics"),
+         InlineKeyboardButton("📈 رسوم بيانية", callback_data="admin_charts")],
+        [InlineKeyboardButton("📤 تصدير البيانات", callback_data="admin_export_data"),
+         InlineKeyboardButton("🔄 تحديث القنوات", callback_data="admin_update_channels")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+async def admin_toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تفعيل/تعطيل وضع الصيانة"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    current_mode = await db.get_setting("maintenance_mode")
+    new_mode = "0" if current_mode else "1"
+    
+    await db.set_setting("maintenance_mode", new_mode)
+    
+    status = "تم تفعيل وضع الصيانة" if new_mode == "1" else "تم تعطيل وضع الصيانة"
+    
+    # مسح التخزين المؤقت
+    db.clear_cache("maintenance_mode")
+    
+    await query.edit_message_text(
+        f"🔧 <b>{status}</b>\n\n"
+        f"📊 <b>حالة النظام الآن:</b>\n"
+        f"• وضع الصيانة: {'🟢 مفعل' if new_mode == '1' else '🔴 معطل'}\n"
+        f"• الوقت: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"👤 <b>المفعِل:</b> {query.from_user.full_name}",
+        parse_mode="HTML"
+    )
+
+async def admin_cleanup_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تنظيف البيانات القديمة"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    # عرض تحذير
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ نعم، قم بالتنظيف", callback_data="admin_cleanup_confirm")],
+        [InlineKeyboardButton("❌ لا، إلغاء", callback_data="admin_panel")]
+    ])
+    
+    auto_cleanup_days = await db.get_setting("auto_cleanup_days", 90)
+    inactive_user_days = await db.get_setting("inactive_user_days", 30)
+    
+    await query.edit_message_text(
+        f"🧹 <b>تنظيف البيانات القديمة</b>\n\n"
+        f"⚠️ <b>تحذير:</b> هذه العملية غير قابلة للتراجع!\n\n"
+        f"📊 <b>سيتم حذف:</b>\n"
+        f"• الأكواد المنتهية الصلاحية (أكثر من {auto_cleanup_days} يوم)\n"
+        f"• سجلات الدفع القديمة (أكثر من {auto_cleanup_days} يوم)\n"
+        f"• سجلات المعاملات القديمة (أكثر من {auto_cleanup_days} يوم)\n"
+        f"• تعطيل المستخدمين غير النشطين (أكثر من {inactive_user_days} يوم)\n"
+        f"• الإشعارات المقروءة القديمة\n"
+        f"• سجلات أنشطة البوت القديمة\n\n"
+        f"هل أنت متأكد من رغبتك في المتابعة؟",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+async def admin_cleanup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تأكيد تنظيف البيانات"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    await query.edit_message_text("⏳ جاري تنظيف البيانات القديمة...")
+    
+    try:
+        # تنفيذ التنظيف
+        await db.cleanup_old_data()
+        
+        await query.edit_message_text(
+            "✅ <b>تم تنظيف البيانات بنجاح!</b>\n\n"
+            "• تم حذف الأكواد المنتهية\n"
+            "• تم حذف السجلات القديمة\n"
+            "• تم تعطيل المستخدمين غير النشطين\n"
+            "• تم تحسين قاعدة البيانات\n\n"
+            "📊 <b>حالة النظام الآن مثالية</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"خطأ في تنظيف البيانات: {e}")
+        await query.edit_message_text(
+            "❌ <b>حدث خطأ أثناء التنظيف!</b>\n\n"
+            f"التفاصيل: {str(e)[:200]}\n\n"
+            "يرجى المحاولة مرة أخرى لاحقاً.",
+            parse_mode="HTML"
+        )
+
+async def admin_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قائمة الإعدادات"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("❌ هذا القسم للأدمن فقط!", show_alert=True)
+        return
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer()
+    
+    await conv_manager.start_conversation(query.from_user.id, STATE_SETTINGS_MENU)
+    
+    # الحصول على جميع الإعدادات
+    settings = await db.get_all_settings()
+    
+    text = "⚙️ <b>إدارة الإعدادات</b>\n\n"
+    text += "📋 <b>الإعدادات الحالية:</b>\n\n"
+    
+    # تصنيف الإعدادات
+    categories = {
+        "النظام العام": [],
+        "النقاط والمكافآت": [],
+        "الدفع والإحالة": [],
+        "الإذاعة والقنوات": [],
+        "الأمان والصيانة": []
+    }
+    
+    for setting in settings:
+        key = setting['key']
+        value = setting['value']
+        description = setting['description']
+        
+        # تصنيف الإعدادات
+        if key in ["maintenance_mode", "conversation_timeout", "auto_cleanup_days", "backup_interval_hours", "rate_limit_enabled"]:
+            categories["النظام العام"].append((key, value, description))
+        elif key in ["welcome_points", "daily_bonus_amount", "min_transfer", "max_transfer_per_day", "max_points_per_user"]:
+            categories["النقاط والمكافآت"].append((key, value, description))
+        elif key in ["referral_points", "points_per_star", "enable_star_payments", "tax_percent"]:
+            categories["الدفع والإحالة"].append((key, value, description))
+        elif key in ["broadcast_delay", "max_broadcast_users", "force_channel_subscription", "check_channels_interval"]:
+            categories["الإذاعة والقنوات"].append((key, value, description))
+        elif key in ["max_warnings", "inactive_user_days", "show_leaderboard", "enable_daily_bonus", "enable_referral_system"]:
+            categories["الأمان والصيانة"].append((key, value, description))
+        else:
+            categories["النظام العام"].append((key, value, description))
+    
+    # عرض الإعدادات
+    for category_name, category_settings in categories.items():
+        if category_settings:
+            text += f"📌 <b>{category_name}:</b>\n"
+            for key, value, description in category_settings:
+                text += f"• <code>{key}</code>: {value} - {description}\n"
+            text += "\n"
+    
+    text += "📝 <b>لتعديل إعداد:</b>\n"
+    text += "أرسل اسم الإعداد والقيمة الجديدة مثل:\n"
+    text += "<code>welcome_points 50</code>\n\n"
+    text += "❌ للإلغاء، أرسل /cancel"
+    
+    await query.edit_message_text(text, parse_mode="HTML")
+    return STATE_SETTINGS_MENU
+
+async def admin_save_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حفظ الإعداد"""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_SETTINGS_MENU
+    
+    input_text = update.message.text.strip()
+    parts = input_text.split(maxsplit=1)
+    
+    if len(parts) != 2:
+        await update.message.reply_text(
+            "❌ تنسيق غير صحيح!\n"
+            "استخدم: <code>اسم_الإعداد القيمة_الجديدة</code>\n\n"
+            "أعد إرسال الإعداد:"
+        )
+        return STATE_SETTINGS_MENU
+    
+    key, value = parts
+    
+    # التحقق من وجود الإعداد
+    existing_setting = await db.execute_query_one(
+        "SELECT data_type, options FROM settings WHERE key = ?",
+        (key,)
+    )
+    
+    if not existing_setting:
+        await update.message.reply_text(
+            f"❌ الإعداد <code>{key}</code> غير موجود!\n"
+            "أعد إرسال اسم إعداد صحيح:"
+        )
+        return STATE_SETTINGS_MENU
+    
+    data_type = existing_setting['data_type']
+    options = existing_setting['options']
+    
+    # التحقق من صحة القيمة بناءً على نوع البيانات
+    try:
+        if data_type == 'integer':
+            int_value = int(value)
+            if options:
+                min_val, max_val = map(int, options.split(','))
+                if not (min_val <= int_value <= max_val):
+                    await update.message.reply_text(
+                        f"❌ القيمة يجب أن تكون بين {min_val} و {max_val}!\n"
+                        "أعد إرسال القيمة:"
+                    )
+                    return STATE_SETTINGS_MENU
+        
+        elif data_type == 'float':
+            float_value = float(value)
+            if options:
+                min_val, max_val = map(float, options.split(','))
+                if not (min_val <= float_value <= max_val):
+                    await update.message.reply_text(
+                        f"❌ القيمة يجب أن تكون بين {min_val} و {max_val}!\n"
+                        "أعد إرسال القيمة:"
+                    )
+                    return STATE_SETTINGS_MENU
+        
+        elif data_type == 'boolean':
+            if value not in ['0', '1']:
+                await update.message.reply_text(
+                    "❌ القيمة يجب أن تكون 0 أو 1!\n"
+                    "أعد إرسال القيمة:"
+                )
+                return STATE_SETTINGS_MENU
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ القيمة غير صحيحة لنوع البيانات {data_type}!\n"
+            "أعد إرسال القيمة:"
+        )
+        return STATE_SETTINGS_MENU
+    
+    # حفظ الإعداد
+    await db.set_setting(key, value)
+    
+    await update.message.reply_text(
+        f"✅ تم تحديث الإعداد <code>{key}</code> إلى <code>{value}</code>\n\n"
+        f"📝 <b>لتعديل إعداد آخر:</b>\n"
+        f"أرسل اسم الإعداد والقيمة الجديدة\n\n"
+        f"❌ للإلغاء، أرسل /cancel"
+    )
+    
+    return STATE_SETTINGS_MENU
+
+async def admin_cancel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء تعديل الإعدادات"""
+    await conv_manager.end_conversation(update.effective_user.id)
+    await update.message.reply_text("❌ تم إلغاء تعديل الإعدادات.")
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🔄 دوال التحويل واستبدال الأكواد المكتملة
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء عملية تحويل النقاط"""
+    query = update.callback_query
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    if await check_maintenance_mode(query.from_user.id):
+        await query.answer("البوت قيد الصيانة حالياً", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    # التحقق من اشتراك القنوات
+    subscribed, message = await check_channel_subscription(query.from_user.id, context)
+    if not subscribed:
+        await query.edit_message_text(message, parse_mode="HTML")
+        return
+    
+    await conv_manager.start_conversation(query.from_user.id, STATE_TRANSFER_ID)
+    
+    await query.edit_message_text(
+        "💸 <b>تحويل النقاط</b>\n\n"
+        "الخطوة 1/2: أرسل <b>آيدي المستخدم</b> الذي تريد التحويل له:\n\n"
+        "📌 <b>ملاحظات:</b>\n"
+        "• يجب أن يكون المستخدم مسجلاً في البوت\n"
+        "• لا يمكن التحويل لنفسك\n"
+        "• الحد الأدنى للتحويل: 10 نقاط\n\n"
+        "❌ للإلغاء، أرسل /cancel",
+        parse_mode="HTML"
+    )
+    return STATE_TRANSFER_ID
+
+async def get_transfer_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الحصول على آيدي المستخدم للتحويل"""
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_TRANSFER_ID
+    
+    try:
+        receiver_id = int(update.message.text.strip())
+        
+        # التحقق من عدم التحويل لنفسه
+        if receiver_id == update.effective_user.id:
+            await update.message.reply_text(
+                "❌ لا يمكن التحويل لنفسك!\n"
+                "أعد إرسال آيدي مستخدم آخر:"
+            )
+            return STATE_TRANSFER_ID
+        
+        # التحقق من وجود المستخدم
+        receiver = await db.get_user(receiver_id)
+        if not receiver:
+            await update.message.reply_text(
+                "❌ المستخدم غير موجود في البوت!\n"
+                "أعد إرسال آيدي مستخدم آخر:"
+            )
+            return STATE_TRANSFER_ID
+        
+        # التحقق من حظر المستخدم
+        if receiver['is_banned'] == 1:
+            await update.message.reply_text(
+                "❌ المستخدم محظور ولا يمكن التحويل له!\n"
+                "أعد إرسال آيدي مستخدم آخر:"
+            )
+            return STATE_TRANSFER_ID
+        
+        # حفظ بيانات التحويل
+        await conv_manager.update_conversation(
+            update.effective_user.id,
+            STATE_TRANSFER_AMOUNT,
+            {'receiver_id': receiver_id, 'receiver_name': receiver['full_name']}
+        )
+        
+        await update.message.reply_text(
+            f"✅ المستخدم: {receiver['full_name']}\n\n"
+            "الخطوة 2/2: أرسل <b>عدد النقاط</b> التي تريد تحويلها:\n\n"
+            "📌 <b>ملاحظات:</b>\n"
+            f"• الحد الأدنى: 10 نقاط\n"
+            f"• رصيدك الحالي: {(await db.get_user(update.effective_user.id))['points']:,} نقطة\n\n"
+            "❌ للإلغاء، أرسل /cancel"
+        )
+        return STATE_TRANSFER_AMOUNT
+        
+    except ValueError:
+        await update.message.reply_text(
+            "❌ يجب إدخال أرقام فقط!\n"
+            "أعد إرسال الآيدي:"
+        )
+        return STATE_TRANSFER_ID
+
+async def get_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الحصول على مبلغ التحويل"""
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_TRANSFER_AMOUNT
+    
+    try:
+        amount = int(update.message.text.strip())
+        
+        # التحقق من الحد الأدنى
+        min_transfer = await db.get_setting("min_transfer", 10)
+        if amount < min_transfer:
+            await update.message.reply_text(
+                f"❌ الحد الأدنى للتحويل هو {min_transfer} نقطة!\n"
+                "أعد إرسال المبلغ:"
+            )
+            return STATE_TRANSFER_AMOUNT
+        
+        # التحقق من رصيد المستخدم
+        sender = await db.get_user(update.effective_user.id)
+        if not sender or sender['points'] < amount:
+            await update.message.reply_text(
+                f"❌ رصيدك غير كافي! الرصيد الحالي: {sender['points']:,} نقطة\n"
+                "أعد إرسال مبلغ أقل:"
+            )
+            return STATE_TRANSFER_AMOUNT
+        
+        # الحصول على بيانات المستقبل
+        conv_data = await conv_manager.get_conversation_data(update.effective_user.id)
+        receiver_id = conv_data.get('receiver_id')
+        receiver_name = conv_data.get('receiver_name', 'مستخدم')
+        
+        # حساب الضريبة
+        tax_percent = await db.get_setting("tax_percent", 25)
+        tax = int(amount * tax_percent / 100)
+        net_amount = amount - tax
+        
+        # تنفيذ التحويل
+        try:
+            # خصم من المرسل مع الضريبة
+            await db.update_points(update.effective_user.id, -amount, "transfer_out", 
+                                 f"تحويل إلى: {receiver_name}", receiver_id)
+            
+            # إضافة للمستقبل بدون الضريبة
+            await db.update_points(receiver_id, net_amount, "transfer_in", 
+                                 f"استلام من: {sender['full_name']}", update.effective_user.id)
+            
+            # تسجيل الضريبة
+            await db.execute_update(
+                """INSERT INTO transactions 
+                (user_id, amount, type, details, related_user_id) 
+                VALUES (?, ?, ?, ?, ?)""",
+                (update.effective_user.id, -tax, "ضريبة", f"ضريبة تحويل: {tax_percent}%", receiver_id)
+            )
+            
+            # إرسال إشعار للمستقبل
+            try:
+                receiver_msg = (
+                    f"💰 <b>تم استلام تحويل نقاط!</b>\n\n"
+                    f"👤 المرسل: {sender['full_name']}\n"
+                    f"🎯 المبلغ: {net_amount:,} نقطة\n"
+                    f"📊 رصيدك الجديد: {(await db.get_user(receiver_id))['points']:,} نقطة"
+                )
+                await safe_api_call(context.bot.send_message, receiver_id, receiver_msg, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"خطأ في إرسال إشعار للمستقبل: {e}")
+            
+            # تأكيد للمرسل
+            await update.message.reply_text(
+                f"✅ <b>تم التحويل بنجاح!</b>\n\n"
+                f"👤 المستقبل: {receiver_name}\n"
+                f"💰 المبلغ المحول: {amount:,} نقطة\n"
+                f"💸 الضريبة ({tax_percent}%): {tax:,} نقطة\n"
+                f"🎯 المبلغ المستلم: {net_amount:,} نقطة\n"
+                f"📊 رصيدك الحالي: {sender['points'] - amount:,} نقطة\n\n"
+                f"شكراً لاستخدامك خدمة التحويل! 🙏",
+                parse_mode="HTML"
+            )
+            
+            logger.info(f"تحويل ناجح: {update.effective_user.id} -> {receiver_id} : {amount} نقطة")
+            
+        except Exception as e:
+            logger.error(f"خطأ في تنفيذ التحويل: {e}")
+            await update.message.reply_text(
+                "❌ <b>حدث خطأ في التحويل!</b>\n\n"
+                "يرجى المحاولة مرة أخرى لاحقاً.",
+                parse_mode="HTML"
+            )
+        
+        await conv_manager.end_conversation(update.effective_user.id)
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text(
+            "❌ يجب إدخال أرقام فقط!\n"
+            "أعد إرسال المبلغ:"
+        )
+        return STATE_TRANSFER_AMOUNT
+
+async def cancel_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء عملية التحويل"""
+    await conv_manager.end_conversation(update.effective_user.id)
+    await update.message.reply_text("❌ تم إلغاء عملية التحويل.")
+    await send_dashboard(update, context)
+    return ConversationHandler.END
+
+async def start_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء عملية استبدال الكود"""
+    query = update.callback_query
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    if await check_maintenance_mode(query.from_user.id):
+        await query.answer("البوت قيد الصيانة حالياً", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    # التحقق من اشتراك القنوات
+    subscribed, message = await check_channel_subscription(query.from_user.id, context)
+    if not subscribed:
+        await query.edit_message_text(message, parse_mode="HTML")
+        return
+    
+    await conv_manager.start_conversation(query.from_user.id, STATE_REDEEM_CODE)
+    
+    await query.edit_message_text(
+        "🎫 <b>استبدال الكود</b>\n\n"
+        "أرسل <b>الكود</b> الذي تريد استبداله:\n\n"
+        "📌 <b>ملاحظات:</b>\n"
+        "• الكود يجب أن يكون باللغة الإنجليزية\n"
+        "• الكود حساس لحالة الأحرف\n"
+        "• كل كود يمكن استخدامه مرة واحدة فقط\n\n"
+        "❌ للإلغاء، أرسل /cancel",
+        parse_mode="HTML"
+    )
+    return STATE_REDEEM_CODE
+
+async def process_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الكود المدخل"""
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(update.effective_user.id)
+    if not allowed:
+        await update.message.reply_text(f"⏱️ {message}")
+        return STATE_REDEEM_CODE
+    
+    code = update.message.text.strip().upper()
+    
+    # استبدال الكود
+    result = await db.redeem_promo_code(update.effective_user.id, code)
+    
+    if isinstance(result, int):
+        # نجاح الاستبدال
+        user_data = await db.get_user(update.effective_user.id)
+        await update.message.reply_text(
+            f"✅ <b>تم استبدال الكود بنجاح!</b>\n\n"
+            f"🎫 الكود: <code>{code}</code>\n"
+            f"🎯 النقاط: {result:,}\n"
+            f"💰 رصيدك الحالي: {user_data['points']:,} نقطة\n\n"
+            f"شكراً لاستخدامك الكود! 🙏",
+            parse_mode="HTML"
+        )
+    else:
+        # فشل الاستبدال
+        error_messages = {
+            "not_found": "❌ الكود غير موجود!",
+            "expired": "❌ الكود منتهي الصلاحية أو تم استخدامه بالكامل!",
+            "used": "❌ لقد استخدمت هذا الكود مسبقاً!",
+            "min_points": "❌ لا تملك النقاط الكافية لاستخدام هذا الكود!",
+            "error": "❌ حدث خطأ في معالجة الكود!"
+        }
+        
+        error_msg = error_messages.get(result, "❌ حدث خطأ غير معروف!")
+        await update.message.reply_text(error_msg)
+    
+    await conv_manager.end_conversation(update.effective_user.id)
+    await send_dashboard(update, context)
+    return ConversationHandler.END
+
+async def cancel_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إلغاء عملية استبدال الكود"""
+    await conv_manager.end_conversation(update.effective_user.id)
+    await update.message.reply_text("❌ تم إلغاء استبدال الكود.")
+    await send_dashboard(update, context)
+    return ConversationHandler.END
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🔌 التشغيل الرئيسي المحسن مع إدارة متقدمة
@@ -3409,7 +4755,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📝 الخطأ: {str(context.error)[:200]}\n"
                 f"⏱️ الوقت: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML")
+            await safe_api_call(context.bot.send_message, ADMIN_ID, admin_msg, parse_mode="HTML")
         except Exception as e:
             logger.error(f"خطأ في إرسال إشعار الأدمن: {e}")
             
@@ -3424,6 +4770,9 @@ async def post_init(application: Application):
     # تنظيف البيانات القديمة تلقائياً
     asyncio.create_task(periodic_cleanup())
     
+    # إعادة تعيين Rate Limiting يومياً
+    asyncio.create_task(daily_rate_limit_reset())
+    
     logger.info("✅ تم تهيئة البوت بنجاح مع جميع الميزات")
 
 async def periodic_cleanup():
@@ -3436,8 +4785,36 @@ async def periodic_cleanup():
         except Exception as e:
             logger.error(f"خطأ في التنظيف الدوري: {e}")
 
+async def daily_rate_limit_reset():
+    """إعادة تعيين Rate Limiting يومياً"""
+    while True:
+        try:
+            await asyncio.sleep(86400)  # كل 24 ساعة
+            db.rate_limit_data.clear()
+            logger.info("✅ تم إعادة تعيين Rate Limiting")
+        except Exception as e:
+            logger.error(f"خطأ في إعادة تعيين Rate Limiting: {e}")
+
+async def unknown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج للكولباك غير المعروف"""
+    query = update.callback_query
+    
+    # التحقق من Rate Limiting
+    allowed, message = await check_rate_limit(query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+    
+    await query.answer("❌ هذا الزر لم يتم برمجته بعد!", show_alert=True)
+
 def main():
     """الدالة الرئيسية لتشغيل البوت مع تحسينات متقدمة"""
+    
+    # التحقق من التوكنات
+    if not BOT_TOKEN:
+        logger.error("❌ لم يتم تعيين BOT_TOKEN!")
+        print("❌ خطأ: يجب تعيين متغير البيئة TELEGRAM_BOT_TOKEN")
+        return
     
     # إنشاء التطبيق
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -3454,7 +4831,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_transfer), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=CONVERSATION_TIMEOUT
+        conversation_timeout=await db.get_setting("conversation_timeout", 300)
     )
     
     # محادثة استبدال الأكواد
@@ -3465,7 +4842,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_redeem), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=CONVERSATION_TIMEOUT
+        conversation_timeout=await db.get_setting("conversation_timeout", 300)
     )
     
     # محادثة إنشاء الأكواد (للأدمن)
@@ -3479,7 +4856,7 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", admin_cancel_code), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=CONVERSATION_TIMEOUT
+        conversation_timeout=await db.get_setting("conversation_timeout", 300)
     )
     
     # محادثة إدارة القنوات
@@ -3489,30 +4866,31 @@ def main():
             STATE_CHANNEL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_get_channel_id)],
             STATE_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_get_channel_link)],
         },
-        fallbacks=[CommandHandler("cancel", admin_channels_menu), CommandHandler("start", start)],
+        fallbacks=[CommandHandler("cancel", admin_cancel_channel), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=CONVERSATION_TIMEOUT
+        conversation_timeout=await db.get_setting("conversation_timeout", 300)
     )
     
     # محادثة إدارة المستخدمين
     users_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(admin_search_by_id_start, pattern="^admin_search_by_id$"),
-            CallbackQueryHandler(admin_search_by_name_start, pattern="^admin_search_by_name$")
+            CallbackQueryHandler(admin_search_by_name_start, pattern="^admin_search_by_name$"),
+            CallbackQueryHandler(admin_search_by_username_start, pattern="^admin_search_by_username$")
         ],
         states={
             STATE_USER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user)],
-            STATE_USER_MANAGE: [
-                CallbackQueryHandler(admin_add_points_callback, pattern="^admin_add_points$"),
-                CallbackQueryHandler(admin_deduct_points_callback, pattern="^admin_deduct_points$"),
-                CallbackQueryHandler(admin_ban_user_callback, pattern="^admin_ban_user$"),
-                CallbackQueryHandler(admin_unban_user_callback, pattern="^admin_unban_user$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_process_points)
-            ]
+            STATE_ADD_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_process_points)],
+            STATE_DEDUCT_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_process_points)],
         },
-        fallbacks=[CommandHandler("cancel", admin_users_menu), CommandHandler("start", start)],
+        fallbacks=[
+            CallbackQueryHandler(admin_ban_user_callback, pattern="^admin_ban_user$"),
+            CallbackQueryHandler(admin_unban_user_callback, pattern="^admin_unban_user$"),
+            CommandHandler("cancel", admin_cancel_user_management),
+            CommandHandler("start", start)
+        ],
         allow_reentry=True,
-        conversation_timeout=CONVERSATION_TIMEOUT
+        conversation_timeout=await db.get_setting("conversation_timeout", 300)
     )
     
     # محادثة الإذاعة
@@ -3530,11 +4908,11 @@ def main():
         },
         fallbacks=[
             CallbackQueryHandler(admin_send_broadcast_execute, pattern="^broadcast_send_(normal|pin|group)$"),
-            CommandHandler("cancel", admin_broadcast_menu),
+            CommandHandler("cancel", admin_cancel_broadcast),
             CommandHandler("start", start)
         ],
         allow_reentry=True,
-        conversation_timeout=CONVERSATION_TIMEOUT
+        conversation_timeout=await db.get_setting("conversation_timeout", 300)
     )
     
     # محادثة الدعم الفني
@@ -3544,23 +4922,20 @@ def main():
             STATE_SUPPORT_TICKET: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_ticket_category)],
             STATE_CONFIRM_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_ticket_creation)],
         },
-        fallbacks=[CommandHandler("cancel", support_handler), CommandHandler("start", start)],
+        fallbacks=[CommandHandler("cancel", cancel_ticket), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=CONVERSATION_TIMEOUT
+        conversation_timeout=await db.get_setting("conversation_timeout", 300)
     )
     
     # محادثة تعديل الإعدادات
     settings_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_settings_menu, pattern="^admin_settings$")],
         states={
-            STATE_SETTINGS_MENU: [
-                CallbackQueryHandler(admin_change_setting, pattern="^admin_set_.*$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_setting)
-            ]
+            STATE_SETTINGS_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_setting)],
         },
-        fallbacks=[CommandHandler("cancel", admin_panel), CommandHandler("start", start)],
+        fallbacks=[CommandHandler("cancel", admin_cancel_settings), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=CONVERSATION_TIMEOUT
+        conversation_timeout=await db.get_setting("conversation_timeout", 300)
     )
     
     # تسجيل المعالجات
@@ -3596,6 +4971,7 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_codes_menu, pattern="^admin_codes$"))
     application.add_handler(CallbackQueryHandler(admin_toggle_maintenance, pattern="^admin_toggle_maintenance$"))
     application.add_handler(CallbackQueryHandler(admin_cleanup_data, pattern="^admin_cleanup$"))
+    application.add_handler(CallbackQueryHandler(admin_cleanup_confirm, pattern="^admin_cleanup_confirm$"))
     
     # معالجات الدفع بالنجوم
     if PAYMENT_PROVIDER_TOKEN:
@@ -3608,14 +4984,26 @@ def main():
     
     # معلومات التشغيل
     print("\n" + "="*60)
-    print("🤖 بوت النقاط المتطور - الإصدار المتقدم")
+    print("🤖 بوت النقاط المتطور - الإصدار المحسن للإنتاج")
     print("="*60)
     print(f"🆔 الأدمن: {ADMIN_ID}")
-    print(f"🔧 وضع الصيانة: {'🟢 مفعل' if db.get_setting('maintenance_mode') else '🔴 معطل'}")
-    print(f"⭐ نظام الدفع: {'🟢 مفعل' if PAYMENT_PROVIDER_TOKEN else '🔴 معطل'}")
-    print(f"📊 عدد المستخدمين: {db.get_global_stats()[0]:,}")
-    print(f"💾 نظام المحادثات: 🟢 مفعل (Timeout: {CONVERSATION_TIMEOUT} ثانية)")
-    print(f"🛡️ Flood Control: 🟢 مفعل")
+    print(f"🔧 WAL Mode: 🟢 مفعل")
+    print(f"🛡️ Rate Limiting: 🟢 مفعل")
+    print(f"💾 Connection Pool: 🟢 مفعل")
+    print(f"⏱️ Conversation Timeout: {await db.get_setting('conversation_timeout', 300)} ثانية")
+    print(f"🔄 Flood Control: 🟢 مفعل")
+    print("="*60)
+    
+    # الحصول على إحصائيات أولية
+    try:
+        users_count = (await db.get_global_stats())[0]
+        maintenance = await db.get_setting("maintenance_mode")
+        print(f"📊 عدد المستخدمين: {users_count:,}")
+        print(f"🔧 وضع الصيانة: {'🟢 مفعل' if maintenance else '🔴 معطل'}")
+        print(f"⭐ نظام الدفع: {'🟢 مفعل' if PAYMENT_PROVIDER_TOKEN else '🔴 معطل'}")
+    except:
+        print("📊 جاري تحميل الإحصائيات...")
+    
     print("="*60)
     print("✅ البوت يعمل بكفاءة عالية مع جميع التحسينات...")
     print("="*60 + "\n")
@@ -3628,117 +5016,6 @@ def main():
         drop_pending_updates=True,
         close_loop=False
     )
-
-# دوال مساعدة إضافية (يجب إضافتها)
-
-async def start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بدء عملية تحويل النقاط"""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("أرسل آيدي المستخدم الذي تريد التحويل له:")
-    return STATE_TRANSFER_ID
-
-async def get_transfer_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """الحصول على آيدي المستخدم للتحويل"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def get_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """الحصول على مبلغ التحويل"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def cancel_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إلغاء عملية التحويل"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def start_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بدء عملية استبدال الكود"""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("أرسل الكود الذي تريد استبداله:")
-    return STATE_REDEEM_CODE
-
-async def process_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة الكود المدخل"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def cancel_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إلغاء عملية استبدال الكود"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_search_by_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بدء البحث بالاسم"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_add_points_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إضافة نقاط للمستخدم"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_deduct_points_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """خصم نقاط من المستخدم"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_ban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """حظر مستخدم"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_unban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """فك حظر مستخدم"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_process_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة إضافة/خصم النقاط"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_cancel_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إلغاء إنشاء كود"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_analytics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """قائمة الإحصائيات المتقدمة"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تفعيل/تعطيل وضع الصيانة"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_cleanup_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تنظيف البيانات القديمة"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """قائمة الإعدادات"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_change_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تغيير إعداد"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def admin_save_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """حفظ الإعداد"""
-    # تنفيذ المنطق هنا
-    pass
-
-async def unknown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج للكولباك غير المعروف"""
-    query = update.callback_query
-    await query.answer("❌ هذا الزر لم يتم برمجته بعد!", show_alert=True)
 
 if __name__ == "__main__":
     try:
