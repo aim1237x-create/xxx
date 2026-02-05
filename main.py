@@ -40,7 +40,7 @@ from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # توكن البوت موضوع مباشرة (بدون ENV)
-BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk"
 ADMIN_ID = 8287678319
 PAYMENT_PROVIDER_TOKEN = ""
 
