@@ -4992,4 +4992,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"خطأ فادح في تشغيل البوت: {e}")
         print(f"❌ خطأ فادح: {e}")
-[file content end]
