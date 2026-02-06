@@ -4979,9 +4979,9 @@ async def main():
     print("="*60 + "\n")
     
     # بدء المهام المتكررة
-    asyncio.create_task(periodic_cleanup())
-    asyncio.create_task(daily_rate_limit_reset())
-    asyncio.create_task(conv_manager.start_timeout_checker(application))
+    application.job_queue.run_repeating(lambda context: asyncio.create_task(db.cleanup_old_data()), interval=3600, first=10)
+    application.job_queue.run_repeating(lambda context: db.rate_limit_data.clear(), interval=86400, first=20)
+    application.job_queue.run_repeating(lambda context: asyncio.create_task(conv_manager.check_timeouts(application)), interval=60, first=30)
     
     # تشغيل البوت
     await application.run_polling(
@@ -4989,7 +4989,7 @@ async def main():
         poll_interval=0.5,
         timeout=30,
         drop_pending_updates=True,
-        stop_signals=None
+
     )
 
 if __name__ == "__main__":
