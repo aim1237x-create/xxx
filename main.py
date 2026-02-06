@@ -4979,8 +4979,7 @@ async def main():
         allowed_updates=Update.ALL_TYPES,
         poll_interval=0.5,
         timeout=30,
-        drop_pending_updates=True,
-        close_loop=False
+        drop_pending_updates=True
     )
 
 if __name__ == "__main__":
