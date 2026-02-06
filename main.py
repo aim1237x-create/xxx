@@ -1,5 +1,3 @@
-[file name]: main.py
-[file content begin]
 import logging
 import sqlite3
 import html
