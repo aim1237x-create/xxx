@@ -4979,9 +4979,15 @@ async def main():
     print("="*60 + "\n")
     
     # بدء المهام المتكررة
-    application.job_queue.run_repeating(lambda context: asyncio.create_task(db.cleanup_old_data()), interval=3600, first=10)
-    application.job_queue.run_repeating(lambda context: db.rate_limit_data.clear(), interval=86400, first=20)
-    application.job_queue.run_repeating(lambda context: asyncio.create_task(conv_manager.check_timeouts(application)), interval=60, first=30)
+    (
+    # job_queue call replaced by safe conditional wrapper
+    application.job_queue and application.job_queue.run_repeating(lambda context: asyncio.create_task(db.cleanup_old_data()), interval=3600, first=10)
+    (
+    # job_queue call replaced by safe conditional wrapper
+    application.job_queue and application.job_queue.run_repeating(lambda context: db.rate_limit_data.clear(), interval=86400, first=20)
+    (
+    # job_queue call replaced by safe conditional wrapper
+    application.job_queue and application.job_queue.run_repeating(lambda context: asyncio.create_task(conv_manager.check_timeouts(application)), interval=60, first=30)
     
     # تشغيل البوت
     await application.run_polling(
