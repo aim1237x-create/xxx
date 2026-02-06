@@ -4974,16 +4974,21 @@ async def main():
     asyncio.create_task(daily_rate_limit_reset())
     asyncio.create_task(conv_manager.start_timeout_checker(application))
     
-    # تشغيل البوت
+    # تشغيل البوت (تم إضافة stop_signals=None لمنع المشاكل)
     await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         poll_interval=0.5,
         timeout=30,
-        drop_pending_updates=True
+        drop_pending_updates=True,
+        stop_signals=None
     )
 
 if __name__ == "__main__":
     try:
+        # إصلاح لنظام ويندوز إذا لزم الأمر
+        if os.name == 'nt':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            
         import asyncio
         asyncio.run(main())
     except KeyboardInterrupt:
