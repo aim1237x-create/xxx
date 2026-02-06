@@ -4794,6 +4794,14 @@ async def main():
         print("❌ خطأ: يجب تعيين متغير البيئة TELEGRAM_BOT_TOKEN")
         return
     
+    # --- إصلاح هام: جلب وقت المهلة مرة واحدة فقط لتخفيف الضغط ---
+    try:
+        # محاولة جلب الإعداد، إذا فشل نستخدم 300 ثانية
+        conv_timeout = await db.get_setting("conversation_timeout", 300)
+    except Exception:
+        conv_timeout = 300
+    # -------------------------------------------------------
+
     # إنشاء التطبيق
     application = Application.builder().token(BOT_TOKEN).build()
     
@@ -4809,7 +4817,7 @@ async def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_transfer), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=await db.get_setting("conversation_timeout", 300)
+        conversation_timeout=conv_timeout
     )
     
     # محادثة استبدال الأكواد
@@ -4820,7 +4828,7 @@ async def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_redeem), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=await db.get_setting("conversation_timeout", 300)
+        conversation_timeout=conv_timeout
     )
     
     # محادثة إنشاء الأكواد (للأدمن)
@@ -4834,7 +4842,7 @@ async def main():
         },
         fallbacks=[CommandHandler("cancel", admin_cancel_code), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=await db.get_setting("conversation_timeout", 300)
+        conversation_timeout=conv_timeout
     )
     
     # محادثة إدارة القنوات
@@ -4846,7 +4854,7 @@ async def main():
         },
         fallbacks=[CommandHandler("cancel", admin_cancel_channel), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=await db.get_setting("conversation_timeout", 300)
+        conversation_timeout=conv_timeout
     )
     
     # محادثة إدارة المستخدمين
@@ -4858,6 +4866,7 @@ async def main():
         ],
         states={
             STATE_USER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user)],
+            STATE_USER_MANAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user)], # إضافة حالة احتياطية
             STATE_ADD_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_process_points)],
             STATE_DEDUCT_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_process_points)],
         },
@@ -4868,7 +4877,7 @@ async def main():
             CommandHandler("start", start)
         ],
         allow_reentry=True,
-        conversation_timeout=await db.get_setting("conversation_timeout", 300)
+        conversation_timeout=conv_timeout
     )
     
     # محادثة الإذاعة
@@ -4890,7 +4899,7 @@ async def main():
             CommandHandler("start", start)
         ],
         allow_reentry=True,
-        conversation_timeout=await db.get_setting("conversation_timeout", 300)
+        conversation_timeout=conv_timeout
     )
     
     # محادثة الدعم الفني
@@ -4902,7 +4911,7 @@ async def main():
         },
         fallbacks=[CommandHandler("cancel", cancel_ticket), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=await db.get_setting("conversation_timeout", 300)
+        conversation_timeout=conv_timeout
     )
     
     # محادثة تعديل الإعدادات
@@ -4913,7 +4922,7 @@ async def main():
         },
         fallbacks=[CommandHandler("cancel", admin_cancel_settings), CommandHandler("start", start)],
         allow_reentry=True,
-        conversation_timeout=await db.get_setting("conversation_timeout", 300)
+        conversation_timeout=conv_timeout
     )
     
     # تسجيل المعالجات
@@ -4974,7 +4983,7 @@ async def main():
     asyncio.create_task(daily_rate_limit_reset())
     asyncio.create_task(conv_manager.start_timeout_checker(application))
     
-    # تشغيل البوت (تم إضافة stop_signals=None لمنع المشاكل)
+    # تشغيل البوت
     await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         poll_interval=0.5,
@@ -4988,6 +4997,12 @@ if __name__ == "__main__":
         # إصلاح لنظام ويندوز إذا لزم الأمر
         if os.name == 'nt':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        # --- هذا هو الإصلاح الأساسي: إنشاء الجداول قبل التشغيل ---
+        print("⏳ جاري تهيئة قاعدة البيانات...")
+        db.init_database_sync()
+        print("✅ تم تهيئة قاعدة البيانات بنجاح")
+        # -----------------------------------------------------
             
         import asyncio
         asyncio.run(main())
