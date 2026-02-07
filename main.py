@@ -21,7 +21,7 @@ from telegram.ext import (
 # ⚙️ إعدادات البوت والتهيئة
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-BOT_TOKEN = "7637690071:AAE-MZYASnMZx3iq52aheHbDcq9yE2VQUjk"
+BOT_TOKEN = "8130994366:AAEP5qKlVFRhFqQYPVtgX58NtEjORB-SbKA"
 ADMIN_ID = 8287678319
 LOG_CHANNEL = "@jaisjwjd"  # قناة السجلات
 MANDATORY_CHANNEL = "@Cnejsjwn"  # قناة الاشتراك الإجباري
